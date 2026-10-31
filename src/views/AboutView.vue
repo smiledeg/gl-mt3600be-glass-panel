@@ -1,15 +1,61 @@
 ﻿<script setup lang="ts">
 import { computed, ref } from 'vue'
-import { NCard, NButton, NIcon, NTag, NModal } from 'naive-ui'
+import { NCard, NButton, NIcon, NTag, NModal, useMessage } from 'naive-ui'
 import { OpenOutline, CubeOutline, LogoGithub } from '@vicons/ionicons5'
 import { useDeviceStore } from '@/stores/device'
 import { luciEntryUrl } from '@/utils/luci'
 import { officialUrl } from '@/utils/official'
 import { BUILD_VERSION } from '@/version'
 import { CHANGELOG } from '@/data/changelog'
+import { api } from '@/api'
 
 const device = useDeviceStore()
+const message = useMessage()
 const showChangelog = ref(false)
+const checking = ref(false)
+const checked = ref(false)
+const updateInfo = ref<{ version: string; url: string } | null>(null)
+const updateError = ref('')
+
+function parseVer(v: string) {
+  const s = String(v || '').replace(/^v/i, '')
+  const [main, rev] = s.split('-')
+  return { parts: main.split('.').map((x) => Number(x) || 0), rev: Number(rev) || 0 }
+}
+function isNewer(latest: string, current: string) {
+  const a = parseVer(latest)
+  const b = parseVer(current)
+  const n = Math.max(a.parts.length, b.parts.length)
+  for (let i = 0; i < n; i++) {
+    const x = a.parts[i] ?? 0
+    const y = b.parts[i] ?? 0
+    if (x !== y) return x > y
+  }
+  return a.rev > b.rev
+}
+async function checkUpdate() {
+  if (checking.value) return
+  checking.value = true
+  updateError.value = ''
+  updateInfo.value = null
+  checked.value = false
+  try {
+    const r = await api.call<{ ok: boolean; version?: string; url?: string; err?: string }>('glass', 'check_update', {}, { timeout: 20000 })
+    if (!r?.ok || !r.version) throw new Error(r?.err || '检查更新失败')
+    checked.value = true
+    const latest = String(r.version).replace(/^v/i, '')
+    if (isNewer(latest, BUILD_VERSION)) {
+      updateInfo.value = { version: latest, url: r.url || '' }
+    } else {
+      message.success(`当前已是最新版本 v${BUILD_VERSION}`)
+    }
+  } catch (e) {
+    updateError.value = e instanceof Error ? e.message : String(e)
+    message.error(updateError.value)
+  } finally {
+    checking.value = false
+  }
+}
 
 const model = computed(() => String(device.info?.model ?? 'GL-MT3600BE'))
 const firmware = computed(() => String(device.info?.firmware_version ?? '—'))
@@ -86,8 +132,15 @@ const entries = [
         <div class="v nui-mono">/www/glass/</div>
       </div>
       <div class="actions">
+        <n-button size="small" type="primary" secondary :loading="checking" :disabled="checking" @click="checkUpdate">检查更新</n-button>
         <n-button size="small" type="primary" secondary @click="showChangelog = true">查看更新内容</n-button>
       </div>
+      <div v-if="updateInfo" class="update-box">
+        发现新版本 <b class="nui-mono">v{{ updateInfo.version }}</b>
+        <n-button text type="primary" style="margin-left: 8px" @click="open(updateInfo.url)">前往 GitHub 下载</n-button>
+      </div>
+      <div v-else-if="checked" class="update-box ok">当前已是最新版本</div>
+      <div v-else-if="updateError" class="update-box err">{{ updateError }}</div>
     </n-card>
   </div>
 
@@ -134,7 +187,10 @@ const entries = [
 .k { opacity: 0.55; }
 .v { text-align: right; word-break: break-all; }
 .foot { font-size: 12px; margin-top: 16px; }
-.actions { margin-top: 14px; }
+.actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+.update-box { margin-top: 12px; padding: 10px 12px; border-radius: 10px; font-size: 12.5px; background: var(--chip); }
+.update-box.ok { opacity: 0.7; }
+.update-box.err { color: var(--warn, #f59e0b); }
 @media (max-width: 640px) {
   .kv { grid-template-columns: 92px 1fr; }
   .v { text-align: left; }

@@ -9,12 +9,12 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: '3.0.43-2',
+    version: '3.0.43-3',
     date: '2026-10-31',
-    title: '修复无线终端误显示为有线',
+    title: '手动检查 GitHub 更新',
     items: [
-      '修复手机/平板等 Wi-Fi 终端在局域网测速「本机」被误显示为「有线连接 · 网口 2500 Mbps」的问题。',
-      'Wi-Fi 关联 MAC 与 DHCP 客户端 MAC 不一致（MLO/随机 MAC）时，改为按前 5 段 MAC 前缀匹配；匹配不到也按无线终端显示，不再误判为有线。',
+      '关于页新增「检查更新」按钮，只在用户点击时请求 GitHub Releases，不会自动检测。',
+      '发现新版本时显示版本号和「前往 GitHub 下载」入口；已是最新则直接提示，不自动下载或安装。',
     ],
   },
 ]

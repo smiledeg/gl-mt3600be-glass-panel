@@ -99,8 +99,23 @@ const message = useMessage()
 /* 版本自检：后台文件已更新、但当前标签页还跑着旧 bundle 时提示刷新 */
 const latestVersion = ref('')
 const verDismissed = ref(false)
-const latestBase = computed(() => String(latestVersion.value || '').split('-')[0])
-const outdated = computed(() => !!latestBase.value && latestBase.value !== BUILD_VERSION && !verDismissed.value)
+function versionParts(v: string) {
+  const s = String(v || '').replace(/^v/i, '')
+  const [main, rev] = s.split('-')
+  return { parts: main.split('.').map((x) => Number(x) || 0), rev: Number(rev) || 0 }
+}
+function versionNewer(a: string, b: string) {
+  const x = versionParts(a)
+  const y = versionParts(b)
+  const n = Math.max(x.parts.length, y.parts.length)
+  for (let i = 0; i < n; i++) {
+    const p = x.parts[i] ?? 0
+    const q = y.parts[i] ?? 0
+    if (p !== q) return p > q
+  }
+  return x.rev > y.rev
+}
+const outdated = computed(() => !!latestVersion.value && versionNewer(latestVersion.value, BUILD_VERSION) && !verDismissed.value)
 function reloadPage() {
   window.location.reload()
 }

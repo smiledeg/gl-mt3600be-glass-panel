@@ -1229,4 +1229,17 @@ M.client_link = function(params)
     return { ok = true, wired = true, linkspeed = wired_port_speed() }
 end
 
+
+--- @object-method: check_update
+M.check_update = function()
+    local body = run("uclient-fetch -q -T 8 -O - 'https://api.github.com/repos/smiledeg/gl-mt3600be-glass-panel/releases/latest' 2>/dev/null")
+    if not body or body == "" then
+        return { ok = false, err = "无法连接 GitHub，请检查路由器外网" }
+    end
+    local tag = body:match('"tag_name"%s*:%s*"([^"]+)"')
+    local url = body:match('"html_url"%s*:%s*"([^"]+)"')
+    if not tag then return { ok = false, err = "GitHub 返回格式异常" } end
+    return { ok = true, version = tag:gsub("^v", ""), tag = tag, url = url or "" }
+end
+
 return M
