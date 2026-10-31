@@ -29,6 +29,7 @@ import GaugeArc from '@/components/GaugeArc.vue'
 import { BUILD_VERSION } from '@/version'
 import { shortError } from '@/composables/useAsync'
 import { fmtBytes } from '@/utils/format'
+import { api } from '@/api'
 import { mbps, runLanCgiTest, speedApi, type CnNodes, type ExpState, type SpeedHist, type SpeedServers, type VideoResult, type VideoItem, type WanState, type WebResult } from '@/api/speed'
 
 type Tab = 'wan' | 'web' | 'video' | 'lan'
@@ -67,6 +68,14 @@ function niceMax(v: number) {
   return steps.find((s) => s >= need) ?? Math.ceil(need / 1000) * 1000
 }
 
+const tabSlide = ref<'left' | 'right'>('left')
+function switchTab(k: Tab) {
+  if (k === tab.value) return
+  const a = TABS.findIndex((x) => x.key === tab.value)
+  const b = TABS.findIndex((x) => x.key === k)
+  tabSlide.value = b >= a ? 'left' : 'right'
+  tab.value = k
+}
 const tab = ref<Tab>((['wan', 'web', 'video', 'lan'] as string[]).includes(String(route.query.tab)) ? (String(route.query.tab) as Tab) : 'wan')
 watch(() => route.query.tab, (q) => {
   const v = String(q || '')
@@ -96,12 +105,13 @@ const wanUlSeries = ref<number[]>([])
 /** 仪表盘平滑显示的目标值：测试中是实时速率，完成后定格为最终下载 */
 const wanLiveTarget = computed(() => {
   const s = wanState.value
-  if (s.phase === 'dl' || s.phase === 'ul') return Number(s.cur || s.avg || 0)
+  if (s.phase === 'dl' || s.phase === 'ul') return Number(s.avg || s.cur || 0)
   if (s.phase === 'done') return Number(s.dl || 0)
   return 0
 })
-const wanDisplay = useSmooth(() => wanLiveTarget.value)
-const wanMax = computed(() => niceMax(Math.max(wanLiveTarget.value, Number(wanState.value.dl || 0))))
+const wanDisplay = useSmooth(() => wanLiveTarget.value, 0.08)
+/** 量程在单次测速过程中固定，只在开始/结束按结果调整，避免实时值带着量程一起跳 */
+const wanMax = ref(1500)
 const hist = ref<SpeedHist[]>([])
 let wanTimer: number | undefined
 
@@ -199,6 +209,12 @@ async function loadWan(force = false) {
     srv.value = s
     cn.value = n
     hist.value = s.history ?? []
+    if (s.client) {
+      lanClient.value = s.client
+      void loadLanClientDetail()
+    } else {
+      void loadLanClientIp()
+    }
     void speedApi.probe(force).then((p) => (probe.value = p.latency ?? {})).catch(() => {})
   } catch (e) {
     wanError.value = shortError(e)
@@ -226,6 +242,7 @@ async function wanPoll() {
       }
     }
     if (!st.running && st.phase === 'done') {
+      wanMax.value = niceMax(Math.max(Number(st.dl || 0), Number(st.ul || 0), 10) * 1.15)
       stopWanPoll()
       void loadWan(true)
     } else if (!st.running && (st.phase === 'error' || st.phase === 'stopped')) {
@@ -239,6 +256,8 @@ async function wanPoll() {
 async function startWan() {
   try {
     await speedApi.start({ server: serverSel.value, duration: duration.value, conn: conn.value, cap: cap.value })
+    const prev = Math.max(Number(wanState.value.dl || 0), Number(wanState.value.ul || 0))
+    if (prev > 0) wanMax.value = niceMax(prev * 1.25)
     wanDlSeries.value = []
     wanUlSeries.value = []
     wanState.value = { phase: 'starting' }
@@ -437,10 +456,68 @@ const lanLiveTarget = computed(() => {
   if (s.phase === 'done') return Number(s.dl || 0)
   return 0
 })
-const lanDisplay = useSmooth(() => lanLiveTarget.value)
-const lanMax = computed(() => niceMax(Math.max(lanLiveTarget.value, Number(lanState.value.dl || 0), Number(lanState.value.ul || 0))))
+const lanDisplay = useSmooth(() => lanLiveTarget.value, 0.08)
+const lanMax = ref(2500)
 const lanState = ref<{ phase: string; dl?: number; ul?: number; cur: number; progress: number; dlBytes?: number; ulBytes?: number; error?: string }>({ phase: 'idle', cur: 0, progress: 0 })
 const lanClient = ref('')
+interface LanClientDetail { ip: string; text: string; wired: boolean }
+const lanClientDetail = ref<LanClientDetail | null>(null)
+const lanClientBusy = ref(false)
+async function loadLanClientIp() {
+  try {
+    const r = await fetch('/glass/clientinfo', { cache: 'no-store' })
+    if (!r.ok) return
+    const j = await r.json()
+    if (j?.ip) {
+      lanClient.value = String(j.ip)
+      await loadLanClientDetail()
+    }
+  } catch {
+    /* 同源接口不可用时保持原值 */
+  }
+}
+async function loadLanClientDetail() {
+  const ip = lanClient.value
+  if (!ip) return
+  lanClientBusy.value = true
+  try {
+    const r = await api.call<{ clients?: Record<string, unknown>[] }>('clients', 'get_list')
+    const c = (r.clients ?? []).find((x) => String(x.ipaddr ?? x.ip ?? '') === ip)
+    if (!c) {
+      lanClientDetail.value = { ip, text: '', wired: false }
+      return
+    }
+    const rawType = String(c.type ?? c.iface ?? '')
+    const iface = String(c.iface ?? '')
+    const wireless = Number(c.type) === 1 || /wireless|wifi|5g|2g/i.test(iface + rawType)
+    const mac = String(c.mac ?? '')
+    let link: { ok?: boolean; wired?: boolean; band?: string; ssid?: string; signal?: number; txrate?: number; rxrate?: number; linkspeed?: number } | null = null
+    if (mac) {
+      try { link = await api.call('glass', 'client_link', { mac }) } catch { link = null }
+    }
+    if (link?.ok && link.wired === false) {
+      const parts = [`${link.band || 'Wi-Fi'} Wi-Fi`]
+      if (link.ssid) parts.push(link.ssid)
+      if (link.signal !== undefined && link.signal !== null) parts.push(`信号 ${link.signal} dBm`)
+      if (link.txrate) parts.push(`协商速率 ${Math.round(link.txrate)}/${Math.round(link.rxrate || 0)} Mbps`)
+      lanClientDetail.value = { ip, text: parts.join(' · '), wired: false }
+    } else if (link?.ok && link.wired) {
+      lanClientDetail.value = { ip, text: link.linkspeed ? `有线连接 · 网口 ${link.linkspeed} Mbps` : '有线连接', wired: true }
+    } else if (wireless) {
+      // 官方 clients.get_list 在 GL 固件上通常不带信号字段；能拿到多少显示多少
+      const parts = ['Wi-Fi']
+      if (c.ssid) parts.push(String(c.ssid))
+      if (c.rssi !== undefined && c.rssi !== null && c.rssi !== '') parts.push(`信号 ${c.rssi} dBm`)
+      lanClientDetail.value = { ip, text: parts.join(' · '), wired: false }
+    } else {
+      lanClientDetail.value = { ip, text: '有线连接', wired: true }
+    }
+  } catch {
+    lanClientDetail.value = { ip, text: '', wired: false }
+  } finally {
+    lanClientBusy.value = false
+  }
+}
 let lanCgiAbort: AbortController | null = null
 let lanPopup: Window | null = null
 let lanIframe: HTMLIFrameElement | null = null
@@ -502,6 +579,7 @@ function lanHandleMessage(seq: number, d: any) {
     if (d.phase === 'dl') lanState.value = { ...lanState.value, dl: d.avg, dlBytes: d.bytes, cur: 0, progress: 0 }
     else lanState.value = { ...lanState.value, ul: d.avg, ulBytes: d.bytes, cur: 0, progress: 0 }
   } else if (d.type === 'done') {
+    lanMax.value = niceMax(Math.max(Number(d.dl || 0), Number(d.ul || 0), 10) * 1.15)
     lanState.value = { phase: 'done', dl: d.dl, ul: d.ul, cur: 0, progress: 100, dlBytes: d.dlBytes, ulBytes: d.ulBytes }
     lanRunning.value = false
     cleanupLanTransport()
@@ -542,6 +620,7 @@ async function lanCgiFallback(seq: number, reason?: string) {
       },
     })
     if (seq !== lanSeq.value) return
+    lanMax.value = niceMax(Math.max(Number(r.dl || 0), Number(r.ul || 0), 10) * 1.15)
     lanState.value = { phase: 'done', dl: r.dl, ul: r.ul, cur: 0, progress: 100, dlBytes: r.dlBytes, ulBytes: r.ulBytes }
   } catch (e) {
     if (seq === lanSeq.value) lanState.value = { phase: 'error', cur: 0, progress: 0, error: shortError(e) }
@@ -556,6 +635,8 @@ async function startLan() {
   const seq = ++lanSeq.value
   cleanupLanTransport()
   lanBusy.value = true
+  const prevLan = Math.max(Number(lanState.value.dl || 0), Number(lanState.value.ul || 0))
+  if (prevLan > 0) lanMax.value = niceMax(prevLan * 1.25)
   lanLastCur.value = 0
   lanDlSeries.value = []
   lanUlSeries.value = []
@@ -674,12 +755,13 @@ onBeforeUnmount(() => {
     <!-- 页头 tabs -->
     <div class="sp-card sp-tabs-card">
       <div class="sp-tabs">
-        <button v-for="t in TABS" :key="t.key" class="sp-tab" :class="{ active: tab === t.key }" @click="tab = t.key">
+        <button v-for="t in TABS" :key="t.key" class="sp-tab" :class="{ active: tab === t.key }" @click="switchTab(t.key)">
           {{ t.label }}
         </button>
         <span class="sp-ver">v{{ BUILD_VERSION }}</span>
       </div>
 
+      <div :key="tab" class="sp-tab-body" :class="`slide-${tabSlide}`">
       <!-- ======================= 外网测速 ======================= -->
       <PageState v-if="tab === 'wan'" :loading="wanLoading" :error="wanError" @retry="loadWan">
         <div class="pane">
@@ -903,7 +985,10 @@ onBeforeUnmount(() => {
             <n-select v-model:value="lanThreads" size="small" :options="[1, 2, 4, 8].map((v) => ({ label: `${v} 线程`, value: v }))" />
           </label>
           <label class="opt wide"><span>本机</span>
-            <div class="me-val">{{ lanClient || '当前设备（浏览器所在终端）' }}<span class="small muted">浏览器 ↔ 路由器 直连测速</span></div>
+            <div class="me-val">
+              <b class="me-ip">{{ lanClient || '—' }}</b>
+              <span class="small muted">{{ lanClientDetail?.text || (lanClient ? (lanClientBusy ? '正在读取连接方式…' : '浏览器 ↔ 路由器 直连测速') : '当前设备（浏览器所在终端）') }}</span>
+            </div>
           </label>
         </div>
         <div class="stage lan">
@@ -930,8 +1015,20 @@ onBeforeUnmount(() => {
             </div>
             <span v-if="lanState.error" class="warn small">{{ lanState.error }}</span>
           </div>
+          <div class="chart-col">
+            <div class="legend" style="margin-bottom: 2px">
+              <span class="lg"><i style="background: #f472b6" />下载</span>
+              <span class="lg"><i style="background: #22c55e" />上传</span>
+            </div>
+            <Sparkline :series="[lanDlSeries, lanUlSeries]" :colors="['#f472b6', '#22c55e']" :height="140" :capacity="lanSecs * 4 + 20" />
+            <div class="axis-row"><span>0s</span><span>{{ lanSecs }}s</span></div>
+            <div class="meta">
+              <span v-if="lanRunning && lanLiveTarget">实时 {{ mbps(lanLiveTarget) }} Mbps</span>
+              <span v-if="lanState.dlBytes || lanState.ulBytes">共传输 {{ fmtBytes((lanState.dlBytes ?? 0) + (lanState.ulBytes ?? 0)) }}</span>
+            </div>
+          </div>
           <div class="side">
-            <!-- 右侧：只显示最终结果（与 NUI 一致，实时值看左边仪表盘） -->
+            <!-- 右侧：最终结果 + 进度（与外网测速同样的布局） -->
             <div class="tiles two">
               <div class="tile">
                 <div class="t-label"><n-icon :size="16" style="opacity:.8"><DownloadOutline /></n-icon>下载（路由器 → 本机）</div>
@@ -944,14 +1041,7 @@ onBeforeUnmount(() => {
                 <div class="t-sub small muted">{{ lanState.ulBytes ? fmtBytes(lanState.ulBytes) : '—' }}</div>
               </div>
             </div>
-            <div class="lan-chart">
-              <Sparkline :series="[lanDlSeries, lanUlSeries]" :colors="['#f472b6', '#22c55e']" :height="128" :capacity="lanSecs * 4 + 20" />
-              <div class="axis-row"><span>0s</span><span>{{ lanSecs }}s</span></div>
-              <div v-if="lanState.dlBytes || lanState.ulBytes" class="small muted" style="margin-top: 4px">
-                共传输 {{ fmtBytes((lanState.dlBytes ?? 0) + (lanState.ulBytes ?? 0)) }}
-              </div>
-            </div>
-            <div v-if="lanRunning" class="prog-row">
+            <div class="prog-row">
               <span class="small">0s</span>
               <div class="prog"><i :style="{ width: `${lanState.progress || 0}%` }" /></div>
               <span class="small">{{ lanSecs }}s</span>
@@ -959,6 +1049,7 @@ onBeforeUnmount(() => {
             <span v-if="isHttps" class="small muted">HTTPS 下会弹出 HTTP 小窗口测速（需允许弹窗）</span>
           </div>
         </div>
+      </div>
       </div>
     </div>
 
@@ -1031,6 +1122,17 @@ onBeforeUnmount(() => {
 }
 .sp-tab.active { opacity: 1; font-weight: 600; }
 .sp-ver { margin-left: auto; font-size: 11px; line-height: 1; opacity: 0.45; }
+.sp-tab-body { will-change: transform, opacity; }
+.sp-tab-body.slide-left { animation: sp-slide-left 0.28s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.sp-tab-body.slide-right { animation: sp-slide-right 0.28s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+@keyframes sp-slide-left {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes sp-slide-right {
+  from { opacity: 0; transform: translateX(-16px); }
+  to { opacity: 1; transform: none; }
+}
 .sp-tab.active::after {
   content: '';
   position: absolute;
@@ -1070,10 +1172,10 @@ onBeforeUnmount(() => {
 
 .stage { display: grid; gap: 18px; align-items: start; }
 .stage.wan { grid-template-columns: 200px minmax(0, 1fr) 340px; }
-.stage.lan { grid-template-columns: 200px minmax(0, 1fr); }
+.stage.lan { grid-template-columns: 200px minmax(0, 1fr) 340px; }
 @media (max-width: 1100px) {
-  .stage.wan { grid-template-columns: 200px minmax(0, 1fr); }
-  .stage.wan .side { grid-column: 1 / -1; }
+  .stage.wan, .stage.lan { grid-template-columns: 200px minmax(0, 1fr); }
+  .stage.wan .side, .stage.lan .side { grid-column: 1 / -1; }
   .stage.wan .side .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 @media (max-width: 820px) {
@@ -1145,7 +1247,9 @@ onBeforeUnmount(() => {
 .lg i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
 .prog-row { display: flex; align-items: center; gap: 10px; }
 .prog { flex: 1; height: 8px; border-radius: 6px; background: rgba(128, 128, 128, 0.16); overflow: hidden; }
-.prog i { display: block; height: 100%; border-radius: 6px; background: linear-gradient(90deg, var(--sp-purple), var(--sp-accent)); transition: width 0.25s; }
+.prog i { display: block; height: 100%; border-radius: 6px; background: var(--nui-accent, #2080f0);
+  background: linear-gradient(90deg, var(--nui-accent, #2080f0), color-mix(in srgb, var(--nui-accent, #2080f0) 55%, #ffffff));
+  transition: width 0.25s; }
 .meta { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; line-height: 1.6; opacity: 0.78; min-height: 18px; }
 .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .go { min-width: 150px; }
@@ -1187,6 +1291,7 @@ onBeforeUnmount(() => {
 .kv span { opacity: 0.65; }
 .kv b { text-align: right; font-weight: 500; }
 .me-val { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.me-ip { font-size: 15px; font-weight: 650; letter-spacing: .2px; }
 
 .hist-card { padding-top: 12px; }
 .hist-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
@@ -1201,5 +1306,8 @@ onBeforeUnmount(() => {
   .h-row > :last-child { display: none; }
   .opts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .opt.wide { grid-column: 1 / -1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sp-tab-body { animation: none !important; }
 }
 </style>

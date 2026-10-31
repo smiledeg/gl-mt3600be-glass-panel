@@ -36,7 +36,7 @@ defineEmits<{ (e: 'retry'): void }>()
       </div>
     </n-alert>
     <n-empty v-else-if="empty" :description="emptyText" size="small" class="empty" />
-    <slot v-else />
+    <div v-else class="ps-body"><slot /></div>
   </div>
 </template>
 
@@ -67,6 +67,16 @@ defineEmits<{ (e: 'retry'): void }>()
 }
 .empty {
   padding: 26px 0;
+}
+.ps-body {
+  animation: ps-body-in 0.34s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+@keyframes ps-body-in {
+  from { opacity: 0; transform: translateY(-9px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ps-body { animation: none; }
 }
 .compact .empty {
   padding: 12px 0;

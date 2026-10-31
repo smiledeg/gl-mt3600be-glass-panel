@@ -74,7 +74,6 @@ const shown = computed(() => {
       <div class="g-value">{{ shown }}</div>
       <div class="g-unit">{{ unit }}</div>
     </div>
-    <div class="g-scale">{{ maxValue }} {{ unit }}</div>
   </div>
 </template>
 
@@ -106,13 +105,5 @@ const shown = computed(() => {
 .g-unit {
   font-size: 12px;
   opacity: 0.7;
-}
-.g-scale {
-  position: absolute;
-  right: 8px;
-  bottom: 2px;
-  font-size: 10px;
-  opacity: 0.45;
-  white-space: nowrap;
 }
 </style>
