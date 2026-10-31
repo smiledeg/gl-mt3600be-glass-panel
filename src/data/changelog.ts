@@ -9,12 +9,12 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: '3.0.43-3',
+    version: '3.1.0-1',
     date: '2026-10-31',
-    title: '手动检查 GitHub 更新',
+    title: '3.1 手动更新检测测试版',
     items: [
-      '关于页新增「检查更新」按钮，只在用户点击时请求 GitHub Releases，不会自动检测。',
-      '发现新版本时显示版本号和「前往 GitHub 下载」入口；已是最新则直接提示，不自动下载或安装。',
+      '用于验证关于页「检查更新」：当前设备 3.0.43-3 应能检测到 3.1.0-1。',
+      '本版本没有额外功能改动，仅版本号更新；不会自动下载或安装。',
     ],
   },
 ]
