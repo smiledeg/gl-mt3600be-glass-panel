@@ -78,7 +78,7 @@ VPN 与组网 概览 · 客户端 · WireGuard/OpenVPN 服务端 · Tailscale ·
 
 ```sh
 # 安装（设备上）
-opkg install --force-reinstall /tmp/gl-glass-panel_3.0.43-1_all.ipk
+opkg install --force-reinstall /tmp/gl-glass-panel_3.0.43-2_all.ipk
 
 # 卸载（还原入口，官方后台不受影响）
 opkg remove gl-glass-panel
@@ -125,7 +125,7 @@ $env:GL_PASS='<后台密码>'; node tools/verify.mjs --host <路由器地址> --
 
 ## 安装包
 
-最新构建：`release/gl-glass-panel_3.0.43-1_all.ipk`；当前版本更新内容见 `release/RELEASE_NOTES.md`。
+最新构建：`release/gl-glass-panel_3.0.43-2_all.ipk`；当前版本更新内容见 `release/RELEASE_NOTES.md`。
 
 ## 开源说明
 

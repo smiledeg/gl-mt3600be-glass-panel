@@ -501,14 +501,15 @@ async function loadLanClientDetail() {
       if (link.signal !== undefined && link.signal !== null) parts.push(`信号 ${link.signal} dBm`)
       if (link.txrate) parts.push(`协商速率 ${Math.round(link.txrate)}/${Math.round(link.rxrate || 0)} Mbps`)
       lanClientDetail.value = { ip, text: parts.join(' · '), wired: false }
-    } else if (link?.ok && link.wired) {
-      lanClientDetail.value = { ip, text: link.linkspeed ? `有线连接 · 网口 ${link.linkspeed} Mbps` : '有线连接', wired: true }
     } else if (wireless) {
-      // 官方 clients.get_list 在 GL 固件上通常不带信号字段；能拿到多少显示多少
-      const parts = ['Wi-Fi']
+      // 无线终端即使后端没匹配到关联信息，也不能误显示成“有线连接”
+      const bandText = /5g/i.test(iface) ? '5G Wi-Fi' : /2g/i.test(iface) ? '2.4G Wi-Fi' : 'Wi-Fi'
+      const parts = [bandText]
       if (c.ssid) parts.push(String(c.ssid))
       if (c.rssi !== undefined && c.rssi !== null && c.rssi !== '') parts.push(`信号 ${c.rssi} dBm`)
       lanClientDetail.value = { ip, text: parts.join(' · '), wired: false }
+    } else if (link?.ok && link.wired) {
+      lanClientDetail.value = { ip, text: link.linkspeed ? `有线连接 · 网口 ${link.linkspeed} Mbps` : '有线连接', wired: true }
     } else {
       lanClientDetail.value = { ip, text: '有线连接', wired: true }
     }

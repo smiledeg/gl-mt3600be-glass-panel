@@ -1179,11 +1179,16 @@ local function wifi_client_info(mac)
     local devs = run("iwinfo 2>/dev/null")
     for dev in devs:gmatch("([%w_%-]+)%s+ESSID:") do
         local assoc = run("iwinfo " .. dev .. " assoclist 2>/dev/null")
-        if assoc ~= "" and assoc:lower():find(lower, 1, true) then
+        if assoc ~= "" then
+            -- 手机 MLO 时 DHCP/客户端列表 MAC 可能是 MLD 地址，关联 MAC 只差最后一段；
+            -- 先精确匹配，找不到再用前 5 段前缀匹配。
+            local needle = lower
+            if not assoc:lower():find(lower, 1, true) then needle = lower:sub(1, 14) end
+            if assoc:lower():find(needle, 1, true) then
             local signal, rx, tx
             local started = false
             for line in assoc:gmatch("[^\n]+") do
-                if line:lower():find(lower, 1, true) then
+                if line:lower():find(needle, 1, true) then
                     started = true
                     signal = tonumber(line:match("(-?%d+) dBm")) or signal
                 elseif started then
@@ -1200,6 +1205,7 @@ local function wifi_client_info(mac)
             local band = ""
             if freq > 0 then band = freq >= 5 and "5G" or "2.4G" end
             return { ok = true, wired = false, band = band, ssid = ssid, signal = signal, txrate = tx, rxrate = rx }
+        end
         end
     end
     return nil
