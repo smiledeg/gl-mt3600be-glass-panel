@@ -9,11 +9,12 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: '3.0.41',
-    date: '2026-10-30',
-    title: '恢复更新内容入口',
+    version: '3.0.42',
+    date: '2026-10-31',
+    title: '修复 postinst 未找到（安装返回 127）',
     items: [
-      '关于页恢复「查看更新内容」入口：面板内只展示当前版本更新，历史版本统一放在 GitHub Releases。',
+      '修复 ipk 控制脚本 postinst 使用 CRLF 换行，导致 opkg 执行时 /bin/sh: postinst: not found（状态 127）的问题。',
+      '控制脚本统一改为 LF 换行，ipk/apk 均重新打包；安装/升级不再报 postinst 失败。',
     ],
   },
 ]
