@@ -1,0 +1,29 @@
+{
+  "name": "gl-mt3600be-glass-panel",
+  "private": true,
+  "version": "3.0.41",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:only": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vicons/ionicons5": "^0.13.0",
+    "naive-ui": "^2.40.3",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "puppeteer-core": "^25.16.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  },
+  "description": "Vue 3 admin panel for GL.iNet GL-MT3600BE (Glass Panel)",
+  "license": "MIT"
+}

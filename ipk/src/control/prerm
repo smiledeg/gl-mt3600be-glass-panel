@@ -1,0 +1,9 @@
+#!/bin/sh
+# Glass Panel v3 - prerm
+# 升级/重装时先清掉旧前端产物：带 hash 的 assets 每次构建都换名字，不清会越积越多。
+# （卸载场景 postrm 会整体删除 /www/glass，这里清掉也无副作用）
+rm -rf /www/glass/assets 2>/dev/null || true
+/etc/init.d/glass-rate stop >/dev/null 2>&1 || true
+/etc/init.d/glass-rate disable >/dev/null 2>&1 || true
+rm -f /tmp/glass-rate.jsonl /usr/bin/glass-rate /etc/init.d/glass-rate 2>/dev/null || true
+exit 0

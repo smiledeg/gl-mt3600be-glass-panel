@@ -1,0 +1,1175 @@
+--[[
+    @object-name: glass
+    @object-desc: 高级后台（Glass Panel）专用只读 RPC —— 补齐官方 system/wifi/clients
+                  模块没有暴露的实时指标：CPU 占用率、各温度传感器、风扇转速、
+                  磁盘占用、运行时间、系统时间。
+
+    调用示例：
+      POST /rpc
+      {"jsonrpc":"2.0","id":1,"method":"call",
+       "params":["<sid>","glass","get_status",{}]}
+
+    返回：
+      {
+        "uptime": 121882,                 -- 秒
+        "localtime": 1792448429,          -- 秒
+        "load": [1.25, 0.90, 0.51],
+        "cpu": [12.3, 8.1, 5.0, 4.4],     -- 各核占用率（首次调用为 null）
+        "cpu_avg": 7.4,
+        "memory": {"total":..,"used":..,"available":..,"free":..,"cached":..,"buffers":..},
+        "disk": {"total":..,"used":..,"available":..,"percent":..},
+        "temps": [{"name":"soc_thermal","temp":47.6}, ...],
+        "fan": {"speed": 2932, "status": true}
+      }
+
+    说明：本模块只读，不修改任何配置。CPU 占用率通过 /tmp 下保存的上一
+    次 /proc/stat 采样做差计算，因此首次调用返回 null，第二次起正常。
+--]]
+
+local M = {}
+
+local CPU_STATE = "/tmp/glass-cpu.stat"
+
+local function read_all(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+local function read_line(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*l")
+    f:close()
+    return s
+end
+
+-- ---------- CPU（总 + 各核） ----------
+local function cpu_percent()
+    local s = read_all("/proc/stat")
+    if not s then return {}, nil end
+
+    local cur = {}
+    for line in s:gmatch("cpu%d+[^\n]*") do
+        local vals = {}
+        for v in line:gmatch("%d+") do vals[#vals + 1] = tonumber(v) end
+        local total = 0
+        for i = 1, math.min(#vals, 8) do total = total + vals[i] end
+        local idle = (vals[4] or 0) + (vals[5] or 0)
+        cur[#cur + 1] = { total = total, idle = idle }
+    end
+
+    local prev = {}
+    local pf = io.open(CPU_STATE, "r")
+    if pf then
+        for line in pf:lines() do
+            local t, i = line:match("(%d+)%s+(%d+)")
+            if t then prev[#prev + 1] = { total = tonumber(t), idle = tonumber(i) } end
+        end
+        pf:close()
+    end
+
+    local out, sum, cnt = {}, 0, 0
+    for i, c in ipairs(cur) do
+        local p = prev[i]
+        local pct = nil
+        if p and c.total > p.total then
+            local dt = c.total - p.total
+            local di = c.idle - p.idle
+            pct = (dt - di) * 100 / dt
+            if pct < 0 then pct = 0 elseif pct > 100 then pct = 100 end
+            sum = sum + pct
+            cnt = cnt + 1
+        end
+        out[#out + 1] = pct
+    end
+
+    local wf = io.open(CPU_STATE, "w")
+    if wf then
+        for _, c in ipairs(cur) do wf:write(c.total, " ", c.idle, "\n") end
+        wf:close()
+    end
+
+    return out, cnt > 0 and (sum / cnt) or nil
+end
+
+-- ---------- 温度 ----------
+local function temperatures()
+    local out = {}
+    for i = 0, 5 do
+        local base = "/sys/class/thermal/thermal_zone" .. i
+        local t = read_line(base .. "/temp")
+        if t then
+            local name = read_line(base .. "/type") or ("zone" .. i)
+            local v = tonumber(t)
+            if v then
+                out[#out + 1] = { name = name, temp = math.floor(v / 100) / 10 }
+            end
+        end
+    end
+    return out
+end
+
+-- ---------- 风扇 ----------
+local function fan_status()
+    local res = { speed = 0, status = false }
+    local p = io.popen("for d in /sys/class/hwmon/hwmon*; do "
+        .. "n=$(cat $d/name 2>/dev/null); "
+        .. "[ \"$n\" = pwmfan ] && cat $d/fan1_input 2>/dev/null; done")
+    if p then
+        local v = p:read("*l")
+        p:close()
+        if v then res.speed = tonumber(v) or 0 end
+    end
+    if res.speed == 0 then
+        local v = read_line("/sys/class/fan/fan_speed")
+        if v then res.speed = tonumber((v:match("(%d+)"))) or 0 end
+    end
+    local state = read_line("/sys/class/thermal/cooling_device0/cur_state")
+    res.status = res.speed > 0 or (tonumber(state or "0") or 0) > 0
+    return res
+end
+
+-- ---------- 内存 ----------
+local function memory()
+    local s = read_all("/proc/meminfo")
+    if not s then return nil end
+    local function g(k)
+        local v = s:match(k .. ":%s+(%d+)")
+        return (tonumber(v) or 0) * 1024
+    end
+    local total = g("MemTotal")
+    local free = g("MemFree")
+    local available = g("MemAvailable")
+    local cached = g("Cached")
+    local buffers = g("Buffers")
+    return {
+        total = total,
+        free = free,
+        available = available,
+        cached = cached,
+        buffers = buffers,
+        used = total - available
+    }
+end
+
+-- ---------- 磁盘 ----------
+local function disk()
+    local p = io.popen("df -k /overlay 2>/dev/null | tail -n 1")
+    if not p then return nil end
+    local line = p:read("*l")
+    p:close()
+    if not line then return nil end
+    local total, used, avail, pct = line:match("^%S+%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%%")
+    if not total then return nil end
+    return {
+        total = (tonumber(total) or 0) * 1024,
+        used = (tonumber(used) or 0) * 1024,
+        available = (tonumber(avail) or 0) * 1024,
+        percent = tonumber(pct) or 0
+    }
+end
+
+-- ---------- 云服务（GL 官方 GoodCloud / DDNS / AstroWarp） ----------
+-- 说明：本方法只做「只读聚合」，把前端无法直接拿到的云端地址、固件区域、
+--       后台进程运行状态汇总返回；真正的开关/绑定仍走官方 cloud / ddns 对象，
+--       以免与官方 UI 产生两套状态。
+M.get_cloud_info = function(params)
+    local fw = (read_line("/etc/firmware_type") or ""):match("%S+") or ""
+    local cn = (fw == "2b")   -- 2b = 国内版（cloud.gl-inet.cn），2c/其它 = 国际版
+
+    local country = read_line("/proc/gl-hw-info/country_code") or ""
+
+    -- 注意：不能用 pgrep -f（会匹配到执行本命令的 shell 自身命令行），
+    --       这里用 -x 精确匹配进程名。
+    local function proc_running(name)
+        local p = io.popen("pgrep -x " .. name .. " 2>/dev/null | head -n 1")
+        if not p then return false end
+        local s = p:read("*l")
+        p:close()
+        return s ~= nil and s ~= ""
+    end
+
+    local function uci_get(key)
+        local p = io.popen("uci -q get " .. key .. " 2>/dev/null")
+        if not p then return nil end
+        local s = p:read("*l")
+        p:close()
+        if s == nil or s == "" then return nil end
+        return s
+    end
+
+    -- 进程检测：GL 的守护进程由 /usr/bin/eco 托管，comm 统一是 eco；
+    -- 按 /proc/<pid>/cmdline 精确匹配，避免 pgrep -x gl-cloud 永远 false。
+    local function proc_cmd_running(needle)
+        local f = io.popen("ls /proc 2>/dev/null")
+        if not f then return false end
+        local found = false
+        for pid in f:lines() do
+            if pid:match("^%d+$") then
+                local cf = io.open("/proc/" .. pid .. "/cmdline", "rb")
+                if cf then
+                    local s = cf:read("*a") or ""
+                    cf:close()
+                    if s:find(needle, 1, true) then
+                        found = true
+                        break
+                    end
+                end
+            end
+        end
+        f:close()
+        return found
+    end
+
+    -- MQTT（云端长连接）是否在线：沿用官方 ubus 状态
+    local mqtt = nil
+    local p = io.popen("ubus call gl-cloud status 2>/dev/null")
+    if p then
+        local s = p:read("*a") or ""
+        p:close()
+        -- 官方返回 {"connected":"00:32:42"}（字符串=已连接时长）或 {"connected":false}
+        if s:match('"connected"%s*:%s*false') then
+            mqtt = false
+        elseif s:match('"connected"%s*:%s*"') or s:match('"connected"%s*:%s*true') then
+            mqtt = true
+        end
+    end
+
+    return {
+        firmware_type = fw,
+        is_cn = cn,
+        country_code = country,
+        goodcloud_url = cn and "https://cloud.gl-inet.cn" or "https://www.goodcloud.xyz",
+        goodcloud_api = cn and "https://api.gl-inet.cn" or "https://api.goodcloud.xyz",
+        astrowarp_url = "https://my.astrowarp.net",
+        astrowarp_api = "https://api.astrowarp.net",
+        ddns_suffix = "glddns.com",
+        -- 官方 UI 中对应页面（hash 路由），用于「在官方后台打开」深链
+        ui_routes = {
+            cloud = "/gl_home.html#/cloud",
+            ddns = "/gl_home.html#/dynamicdns",
+            astrowarp = "/gl_home.html#/astrowarp"
+        },
+        remote_http_port = uci_get("gl_ddns.ddns.http_port") or "80",
+        remote_https_port = uci_get("gl_ddns.ddns.https_port") or "443",
+        -- 按 cmdline 精确识别（comm 都是 eco），rtty 没有时退回名字检测
+        gl_cloud_running = proc_cmd_running("/usr/bin/gl-cloud"),
+        rtty_running = proc_cmd_running("/usr/bin/rtty") or proc_running("rtty"),
+        mptun_enable = uci_get("mptun.global.enable") == "1",
+        mqtt_connected = mqtt      -- nil = 服务未运行，无法判定
+    }
+end
+
+--[[
+    @method-name: get_status
+    @method-desc: 一次性返回面板所需的实时指标。
+    @out-example: 见文件头注释。
+--]]
+M.get_status = function(params)
+    local uptime = tonumber((read_line("/proc/uptime") or ""):match("^(%d+)")) or 0
+    local cpu, cpu_avg = cpu_percent()
+
+    local load = { 0, 0, 0 }
+    local la = read_line("/proc/loadavg")
+    if la then
+        local a, b, c = la:match("^(%S+)%s+(%S+)%s+(%S+)")
+        load = { tonumber(a) or 0, tonumber(b) or 0, tonumber(c) or 0 }
+    end
+
+    local hostname = read_line("/proc/sys/kernel/hostname") or ""
+
+    return {
+        uptime = uptime,
+        localtime = os.time(),
+        load = load,
+        hostname = hostname,
+        cpu = cpu,
+        cpu_avg = cpu_avg,
+        memory = memory(),
+        disk = disk(),
+        temps = temperatures(),
+        fan = fan_status()
+    }
+end
+
+
+--[[ ===================== 联网检测 / WAN 健康检查 / 静态路由 =====================
+     原厂 4.9 的 RPC 里没有「联网检测」，参考实现（luci-app-nradio-nui）
+     是自己在后端做：读默认路由 + 真 ping，配置读写 /etc/config/wanchk。
+     这里同样由本模块补齐，前端只调 glass.conn_check / wanchk_* / route_*。
+--]]
+
+local function run(cmd)
+    local f = io.popen(cmd .. " 2>/dev/null")
+    if not f then return "" end
+    local s = f:read("*a") or ""
+    f:close()
+    return s
+end
+
+local function trim(s)
+    if not s then return "" end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+--- 读默认路由：返回 iface, gateway
+local function default_route()
+    local out = run("ip -4 route show default")
+    local iface, gw = nil, nil
+    for line in out:gmatch("[^\r\n]+") do
+        gw = gw or line:match("via%s+([%d%.]+)")
+        iface = iface or line:match("dev%s+(%S+)")
+    end
+    return iface, gw
+end
+
+--- 单次 ping，返回 ok, 延迟ms
+local function ping_once(host, timeout)
+    local out = run(string.format("ping -c 1 -W %d %s", timeout or 2, host))
+    local t = out:match("time[=<]%s*([%d%.]+)%s*ms")
+    local got = out:match("(%d+)%s+received") or out:match("(%d+) packets received")
+    local ok = (t ~= nil) or (got ~= nil and tonumber(got) > 0)
+    return ok, t and tonumber(t) or nil
+end
+
+--- @object-method: conn_check
+--- 联网检测：默认路由 → 网关 + 两个外网目标（并行，总耗时 ≤2s）→ DNS 解析
+--- 结果缓存 8s：离线时面板/官方页多个轮询同时打进来只会真正探测一次，
+--- 避免每次 ping 超时把 nginx worker（本机仅 2 个）占满导致官方后台也一起卡死。
+local CONN_CACHE = "/tmp/glass-conn.cache"
+local CONN_TTL = 8
+
+local function conn_cached(now)
+    local raw = read_all(CONN_CACHE)
+    if not raw or raw == "" then return nil end
+    local t = {}
+    for k, v in raw:gmatch("([%w_]+)=([^\n]*)") do t[k] = v end
+    local ts = tonumber(t.checked_at) or 0
+    if ts == 0 or now - ts > CONN_TTL then return nil end
+    return {
+        online = t.online == "1",
+        level = t.level ~= "" and t.level or "down",
+        iface = t.iface or "",
+        gateway = t.gateway or "",
+        gateway_ok = t.gw_ok == "1",
+        gateway_latency = t.gw_ms ~= "" and tonumber(t.gw_ms) or nil,
+        target = t.target or "",
+        latency = t.latency ~= "" and tonumber(t.latency) or nil,
+        dns_ok = t.dns_ok == "1",
+        checked_at = ts,
+        cached = true,
+        source = "glass.conn_check",
+    }
+end
+
+local function conn_save(r)
+    local f = io.open(CONN_CACHE, "w")
+    if not f then return end
+    f:write(string.format(
+        "checked_at=%d\nonline=%d\nlevel=%s\niface=%s\ngateway=%s\ngw_ok=%d\ngw_ms=%s\ntarget=%s\nlatency=%s\ndns_ok=%d\n",
+        r.checked_at, r.online and 1 or 0, r.level, r.iface, r.gateway,
+        r.gateway_ok and 1 or 0, r.gateway_latency and tostring(r.gateway_latency) or "",
+        r.target, r.latency and tostring(r.latency) or "", r.dns_ok and 1 or 0))
+    f:close()
+end
+
+M.conn_check = function(params)
+    local now = os.time()
+    if not (params and (params.force == true or params.force == "1")) then
+        local c = conn_cached(now)
+        if c then return c end
+    end
+
+    local iface, gw = default_route()
+    -- 三个 ping 并行跑，wait 总耗时 ≈ 最慢一个（离线 ≤2s）
+    run(string.format(
+        "rm -f /tmp/glass-conn.gw /tmp/glass-conn.h1 /tmp/glass-conn.h2; " ..
+        "( ping -c 1 -W 1 %s >/tmp/glass-conn.gw 2>/dev/null ) & " ..
+        "( ping -c 1 -W 2 223.5.5.5 >/tmp/glass-conn.h1 2>/dev/null ) & " ..
+        "( ping -c 1 -W 2 1.1.1.1 >/tmp/glass-conn.h2 2>/dev/null ) & wait",
+        gw or "127.0.0.1"))
+
+    local function parse(path)
+        local out = read_all(path) or ""
+        local t = out:match("time[=<]%s*([%d%.]+)%s*ms")
+        local got = out:match("(%d+)%s+received") or out:match("(%d+) packets received")
+        return (t ~= nil) or (got ~= nil and tonumber(got) > 0), t and tonumber(t) or nil
+    end
+
+    local gw_ok, gw_ms = parse("/tmp/glass-conn.gw")
+    local online, latency, target = false, nil, nil
+    local o1, m1 = parse("/tmp/glass-conn.h1")
+    local o2, m2 = parse("/tmp/glass-conn.h2")
+    if o1 then
+        online, latency, target = true, m1, "223.5.5.5"
+    elseif o2 then
+        online, latency, target = true, m2, "1.1.1.1"
+    end
+
+    local dns_ok = false
+    if online then
+        -- busybox nslookup 不支持 -timeout=2（会直接报 invalid number），用 timeout 包一层；
+        -- 成功判据：真的解析出 A 记录或 canonical name，不能只看输出里有 "Address"（Server/Address 头永远有）
+        local out = run("timeout 2 nslookup www.baidu.com 2>/dev/null | head -20")
+        dns_ok = out:match("Address:%s*%d+%.%d+%.%d+%.%d+") ~= nil or out:find("canonical name") ~= nil
+    end
+
+    local level = "down"
+    if online then
+        level = "ok"
+    elseif iface or gw_ok then
+        level = "link"
+    end
+
+    local res = {
+        online = online,
+        level = level,
+        iface = iface or "",
+        gateway = gw or "",
+        gateway_ok = gw_ok,
+        gateway_latency = gw_ms,
+        target = target or "",
+        latency = latency,
+        dns_ok = dns_ok,
+        checked_at = now,
+        cached = false,
+        source = "glass.conn_check",
+    }
+    conn_save(res)
+    return res
+end
+
+--- @object-method: wanchk_get
+M.wanchk_get = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { supported = false } end
+    local c = uci.cursor()
+    local out = { supported = true, profiles = {} }
+    c:foreach("wanchk", "wanchk", function(s)
+        out.profiles[#out.profiles + 1] = {
+            name = s[".name"],
+            interface = s.interface or "",
+            dnsopen = s.dnsopen ~= "0",
+            pingopen = s.pingopen ~= "0",
+            timeout = tonumber(s.timeout) or 0,
+            try_count = tonumber(s.try) or 0,
+        }
+    end)
+    return out
+end
+
+--- @object-method: wanchk_set
+M.wanchk_set = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { err_msg = "uci 不可用" } end
+    local c = uci.cursor()
+    local name = params.name
+    if not name then return { err_msg = "缺少 name" } end
+    c:set("wanchk", name, "dnsopen", params.dnsopen and "1" or "0")
+    c:set("wanchk", name, "pingopen", params.pingopen and "1" or "0")
+    if params.timeout then c:set("wanchk", name, "timeout", tostring(params.timeout)) end
+    if params.try_count then c:set("wanchk", name, "try", tostring(params.try_count)) end
+    c:commit("wanchk")
+    return { res = true }
+end
+
+--- 静态路由（UCI network route），仅 IPv4
+local function route_list(c)
+    local out = {}
+    c:foreach("network", "route", function(s)
+        out[#out + 1] = {
+            id = s[".name"],
+            target = s.target or "",
+            netmask = s.netmask or "",
+            gateway = s.gateway or "",
+            interface = s.interface or "",
+            enabled = s.disabled ~= "1",
+        }
+    end)
+    return out
+end
+
+M.route_list = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { supported = false, routes = {} } end
+    local c = uci.cursor()
+    local ifaces = {}
+    c:foreach("network", "interface", function(s)
+        ifaces[#ifaces + 1] = { name = s[".name"], ifname = s.ifname or "", proto = s.proto or "" }
+    end)
+    return { supported = true, routes = route_list(c), interfaces = ifaces }
+end
+
+M.route_save = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { err_msg = "uci 不可用" } end
+    local c = uci.cursor()
+    local id = params.id
+    if id and c:get("network", id) ~= "route" then return { err_msg = "路由不存在" } end
+    if not id then
+        c:set("network", "glass_" .. tostring(os.time()), "route")
+        id = nil
+        local found
+        c:foreach("network", "route", function(s) if not found and s.target == nil then found = s[".name"] end end)
+        id = found
+    end
+    if not id then return { err_msg = "创建失败" } end
+    c:set("network", id, "target", params.target or "")
+    c:set("network", id, "netmask", params.netmask or "255.255.255.255")
+    c:set("network", id, "gateway", params.gateway or "")
+    if params.interface and params.interface ~= "" then
+        c:set("network", id, "interface", params.interface)
+    end
+    c:set("network", id, "disabled", params.enabled == false and "1" or "0")
+    c:commit("network")
+    run("ubus call network reload")
+    return { res = true, routes = route_list(c) }
+end
+
+M.route_del = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { err_msg = "uci 不可用" } end
+    local c = uci.cursor()
+    if c:get("network", params.id or "") ~= "route" then return { err_msg = "路由不存在" } end
+    c:delete("network", params.id)
+    c:commit("network")
+    run("ubus call network reload")
+    return { res = true, routes = route_list(c) }
+end
+M.speedtest = function(params)
+    local url = params.url
+    if not url or url == "" then
+        return { err_msg = "缺少测速地址" }
+    end
+    local sec = tonumber(params.seconds) or 10
+    if sec < 3 then sec = 3 end
+    if sec > 30 then sec = 30 end
+    local max_bytes = (tonumber(params.max_mb) or 300) * 1024 * 1024
+
+    -- 限时下载到 /dev/null，取 curl 自报的平均速率与字节数
+    local out = run(string.format(
+        "curl -L --max-time %d --limit-rate 0 -o /dev/null -s -w '%%{speed_download} %%{size_download} %%{time_total} %%{http_code}' '%s'",
+        sec, url))
+    local speed, bytes, total, code = out:match("([%d%.]+)%s+([%d%.]+)%s+([%d%.]+)%s+(%d+)")
+    if not speed then
+        return { err_msg = "测速失败：" .. (out:sub(1, 120):gsub("%s+$", "")) }
+    end
+
+    local sp = tonumber(speed) or 0
+    local by = tonumber(bytes) or 0
+    if by > max_bytes then by = max_bytes end
+
+    return {
+        ok = true,
+        url = url,
+        kind = params.kind or "wan",
+        speed_bps = sp,
+        speed_mbps = math.floor(sp * 8 / 1000000 * 100 + 0.5) / 100,
+        bytes = by,
+        seconds = tonumber(total) or sec,
+        http_code = tonumber(code) or 0,
+        at = os.time(),
+    }
+end
+
+--- 到目标 host 的 TCP 建连延迟（毫秒），用 curl 的 time_connect
+M.latency = function(params)
+    local host = params.host or params.url
+    if not host then return { err_msg = "缺少目标" } end
+    local url = host:match("^https?://") and host or ("http://" .. host)
+    local out = run(string.format(
+        "curl -o /dev/null -s --max-time 5 -w '%%{time_connect} %%{time_total} %%{http_code}' '%s'", url))
+    local c, t, code = out:match("([%d%.]+)%s+([%d%.]+)%s+(%d+)")
+    if not c then return { err_msg = "探测失败" } end
+    return {
+        ok = true,
+        connect_ms = math.floor((tonumber(c) or 0) * 1000 + 0.5),
+        total_ms = math.floor((tonumber(t) or 0) * 1000 + 0.5),
+        http_code = tonumber(code) or 0,
+    }
+end
+
+
+--[[ ===================== 网络诊断（原厂 diag 对象在 4.9 上不可用） =====================
+     参考实现（m_diag.lua）也是自己跑 shell 命令；这里同样。
+--]]
+
+--- @object-method: diag_ping
+M.diag_ping = function(params)
+    local host = params.host or params.target
+    if not host or host == "" then return { err_msg = "缺少目标地址" } end
+    local cnt = tonumber(params.count) or 4
+    if cnt < 1 then cnt = 1 end
+    if cnt > 10 then cnt = 10 end
+    local out = run(string.format("ping -c %d -W 2 %s", cnt, host))
+    local loss = out:match("(%d+)%% packet loss") or out:match("(%d+)%% loss")
+    local avg = out:match("min/avg/max[^=]*=%s*([%d%.]+)/([%d%.]+)/([%d%.]+)")
+    local rtt = out:match("avg[^=]*=[^/]*/([%d%.]+)")
+    return {
+        ok = #out > 0,
+        host = host,
+        output = out,
+        loss = tonumber(loss),
+        avg_ms = tonumber(rtt) or (avg and tonumber(avg) or nil),
+    }
+end
+
+--- @object-method: diag_trace
+M.diag_trace = function(params)
+    local host = params.host or params.target
+    if not host or host == "" then return { err_msg = "缺少目标地址" } end
+    local hops = tonumber(params.hops) or 8
+    local out = run(string.format("traceroute -m %d -q 1 -w 2 %s", hops, host))
+    if #out == 0 then
+        out = run(string.format("traceroute6 -m %d %s", hops, host))
+    end
+    return { ok = #out > 0, host = host, output = out }
+end
+
+--- @object-method: diag_port
+--- 用 curl 探测 TCP 端口（连上即视为开放），返回建连耗时
+M.diag_port = function(params)
+    local host = params.host
+    local port = tonumber(params.port)
+    if not host or not port then return { err_msg = "缺少 host / port" } end
+    local out = run(string.format(
+        "curl -s -o /dev/null --max-time 5 -w '%%{http_code} %%{time_connect}' 'http://%s:%d'", host, port))
+    local code, t = out:match("(%d+)%s+([%d%.]+)")
+    local c = tonumber(code) or 0
+    local open = c > 0
+    return {
+        ok = open,
+        host = host,
+        port = port,
+        http_code = c,
+        connect_ms = t and math.floor((tonumber(t) or 0) * 1000 + 0.5) or nil,
+        msg = open and "端口可达" or "端口不可达或被拒绝",
+    }
+end
+
+
+--- @object-method: switch_status
+--- 机身拨动开关的当前位置（on/off；无硬件开关时为 nil）
+--- 来源：GL 官方的 get_switch_button_status（/lib/functions/gl_util.sh，读 /sys/kernel/debug/gpio）
+--- 另返回开关绑定的功能（uci switch-button.@main[0].func / sub_func）与原始 GPIO 行，便于前端展示与排障
+M.switch_status = function()
+    local status = trim(run(". /lib/functions/gl_util.sh; get_switch_button_status 2>/dev/null"))
+    local func = trim(run("uci -q get switch-button.@main[0].func 2>/dev/null"))
+    local sub = trim(run("uci -q get switch-button.@main[0].sub_func 2>/dev/null"))
+    local model = trim(read_line("/proc/gl-hw-info/model"))
+    local gpio = trim(run("grep -i -E 'switch|button' /sys/kernel/debug/gpio 2>/dev/null | head -3"))
+    local position = nil
+    if status == "on" then
+        position = "on"
+    elseif status == "off" then
+        position = "off"
+    end
+    return {
+        position = position,
+        supported = status ~= "no support" and status ~= "",
+        raw_status = status,
+        func = (func ~= "" and func) or nil,
+        sub_func = (sub ~= "" and sub) or nil,
+        model = (model ~= "" and model) or nil,
+        gpio = gpio,
+    }
+end
+
+-- =====================================================================
+-- 首页实时速率历史（glass-rate 服务，每 3s 采样一次总速率，内存里保留最近 3 分钟）
+--   rate_history       读取 {enabled, interval, points[]}
+--   rate_history_set   开关（写 uci glass.rate_history + 启动/停止服务）
+-- =====================================================================
+local RATE_FILE = "/tmp/glass-rate.jsonl"
+
+M.rate_history = function(params)
+    local enabled = trim(run("uci -q get glass.glass.rate_history 2>/dev/null")) == "1"
+    local limit = tonumber(params and params.limit) or 60
+    if limit < 1 then limit = 60 end
+    if limit > 120 then limit = 120 end
+    local pts = {}
+    local raw = read_all(RATE_FILE) or ""
+    for line in raw:gmatch("[^\n]+") do
+        local t, rx, tx = line:match("^(%d+)%s+(%d+)%s+(%d+)$")
+        if t then pts[#pts + 1] = { t = tonumber(t), rx = tonumber(rx), tx = tonumber(tx) } end
+    end
+    if #pts > limit then
+        local cut = {}
+        for i = #pts - limit + 1, #pts do cut[#cut + 1] = pts[i] end
+        pts = cut
+    end
+    return { enabled = enabled, interval = 3, points = pts }
+end
+
+M.rate_history_set = function(params)
+    local on = params and (params.enabled == true or params.enabled == 1 or params.enabled == "1")
+    run("touch /etc/config/glass 2>/dev/null")
+    run("uci -q get glass.glass >/dev/null 2>&1 || uci -q set glass.glass=glass")
+    run(string.format("uci -q set glass.glass.rate_history='%d'; uci -q commit glass", on and 1 or 0))
+    if on then
+        run("/etc/init.d/glass-rate enable >/dev/null 2>&1; /etc/init.d/glass-rate restart >/dev/null 2>&1")
+    else
+        run("/etc/init.d/glass-rate disable >/dev/null 2>&1; /etc/init.d/glass-rate stop >/dev/null 2>&1; rm -f /tmp/glass-rate.jsonl")
+    end
+    return { enabled = on }
+end
+
+-- =====================================================================
+-- 自定义背景媒体（界面设置 → 背景 → 视频）
+--   media_begin   {id}                 创建 /www/glass-media/<id>.part
+--   media_chunk   {id, data(base64)}   追加一段（Lua 5.1 手写 base64 解码）
+--   media_finish  {id, ext}            重命名成 <id>.<ext> 并返回 URL
+-- 文件走 nginx 静态 /glass-media/，浏览器直接 <video> 播放。
+-- =====================================================================
+local MEDIA_DIR = "/www/glass-media"
+local B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function b64decode(s)
+    local map = {}
+    for i = 1, #B64_CHARS do map[B64_CHARS:sub(i, i)] = i - 1 end
+    local out = {}
+    for i = 1, #s, 4 do
+        local c1, c2, c3, c4 = s:sub(i, i), s:sub(i + 1, i + 1), s:sub(i + 2, i + 2), s:sub(i + 3, i + 3)
+        local n1, n2 = map[c1], map[c2]
+        if n1 and n2 then
+            local n3 = map[c3] or 0
+            local n4 = map[c4] or 0
+            out[#out + 1] = string.char(n1 * 4 + math.floor(n2 / 16))
+            if c3 ~= "=" and c3 ~= "" then
+                out[#out + 1] = string.char((n2 % 16) * 16 + math.floor(n3 / 4))
+            end
+            if c4 ~= "=" and c4 ~= "" then
+                out[#out + 1] = string.char((n3 % 4) * 64 + n4)
+            end
+        end
+    end
+    return table.concat(out)
+end
+
+--- @object-method: media_begin
+M.media_begin = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    if id == "" then return { ok = false, err = "非法 ID" } end
+    run("mkdir -p " .. MEDIA_DIR)
+    local f = io.open(MEDIA_DIR .. "/" .. id .. ".part", "wb")
+    if not f then return { ok = false, err = "无法写入 /www（空间不足？）" } end
+    f:close()
+    return { ok = true, id = id }
+end
+
+--- @object-method: media_chunk
+M.media_chunk = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    local data = tostring(params and params.data or "")
+    if id == "" or data == "" then return { ok = false, err = "参数不完整" } end
+    local f = io.open(MEDIA_DIR .. "/" .. id .. ".part", "ab")
+    if not f then return { ok = false, err = "写入失败" } end
+    f:write(b64decode(data))
+    f:close()
+    return { ok = true }
+end
+
+--- @object-method: media_finish
+M.media_finish = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    local ext = tostring(params and params.ext or ""):lower():gsub("[^%w]", "")
+    if id == "" or ext == "" then return { ok = false, err = "参数不完整" } end
+    local part = MEDIA_DIR .. "/" .. id .. ".part"
+    local dst = MEDIA_DIR .. "/" .. id .. "." .. ext
+    local ok, err = os.rename(part, dst)
+    if not ok then return { ok = false, err = tostring(err or "保存失败") } end
+    run("chmod 644 '" .. dst .. "' 2>/dev/null")
+    return { ok = true, url = "/glass-media/" .. id .. "." .. ext }
+end
+
+-- =====================================================================
+-- 外观设置（跨设备同步）：存 /etc/glass-appearance.json，所有浏览器/手机共用
+--   appearance_get  读取原始 JSON
+--   appearance_set  写入原始 JSON（wallpaper/video 存 /glass-media/ URL，体积很小）
+-- =====================================================================
+local APPEAR_FILE = "/etc/glass-appearance.json"
+
+M.appearance_get = function()
+    local raw = read_all(APPEAR_FILE) or ""
+    if raw == "" then return { ok = true, raw = "" } end
+    return { ok = true, raw = raw }
+end
+
+M.appearance_set = function(params)
+    local raw = tostring(params and params.raw or "")
+    if #raw > 200000 then return { ok = false, err = "设置内容过大" } end
+    if not raw:match("^%s*{") then return { ok = false, err = "不是合法 JSON" } end
+    local f = io.open(APPEAR_FILE .. ".tmp", "w")
+    if not f then return { ok = false, err = "无法写入 /etc" } end
+    f:write(raw)
+    f:close()
+    os.rename(APPEAR_FILE .. ".tmp", APPEAR_FILE)
+    run("chmod 644 " .. APPEAR_FILE .. " 2>/dev/null")
+    return { ok = true }
+end
+
+
+-- =====================================================================
+-- 默认后台：路由器根路径 / 原厂登录页是否进入增强 WebUI
+--   root_mode_get  当前是否接管
+--   root_mode_set  开启/关闭（备份 -> 写/删 nginx 片段 -> nginx -t -> 失败回滚）
+-- =====================================================================
+local ROOT_CONF = "/etc/nginx/gl-conf.d/zz-glass-root.conf"
+local ROOT_BACKUP_DIR = "/etc/glass-root-backup"
+local ROOT_BACKUP = ROOT_BACKUP_DIR .. "/zz-glass-root.conf.bak"
+local ROOT_DISABLED_FLAG = "/etc/glass-root-disabled"
+local ROOT_CONF_BODY = [==[
+location = / {
+    access_by_lua_file /usr/share/gl-ngx/oui-access.lua;
+    return 302 /glass/;
+}
+location = /gl_home.html {
+    access_by_lua_file /usr/share/gl-ngx/oui-access.lua;
+    if ($arg_official = "1") {
+        rewrite ^ /__glass_official_home last;
+    }
+    return 302 /glass/;
+}
+location = /__glass_official_home {
+    access_by_lua_file /usr/share/gl-ngx/oui-access.lua;
+    alias /www/gl_home.html;
+    default_type text/html;
+    add_header Cache-Control "no-store" always;
+}
+]==]
+
+M.root_mode_get = function()
+    local f = io.open(ROOT_CONF, "r")
+    local enabled = f ~= nil
+    if f then f:close() end
+    return { ok = true, enabled = enabled }
+end
+
+M.root_mode_set = function(params)
+    local enable = params and (params.enabled == true or params.enabled == 1 or params.enabled == "1")
+    run("mkdir -p " .. ROOT_BACKUP_DIR .. " 2>/dev/null")
+    local cur = io.open(ROOT_CONF, "r")
+    if cur then
+        local raw = cur:read("*a") or ""
+        cur:close()
+        local b = io.open(ROOT_BACKUP, "w")
+        if b then b:write(raw); b:close() end
+    end
+    local f = io.open(ROOT_CONF .. ".tmp", "w")
+    if not f then return { ok = false, err = "无法写入 nginx 配置目录" } end
+    if enable then f:write(ROOT_CONF_BODY) end
+    f:close()
+    if enable then
+        os.rename(ROOT_CONF .. ".tmp", ROOT_CONF)
+    else
+        os.remove(ROOT_CONF .. ".tmp")
+        os.remove(ROOT_CONF)
+    end
+    local test = run("nginx -t >/tmp/glass-root-test.log 2>&1; echo $?")
+    if tostring(test):gsub("%s", "") ~= "0" then
+        -- 回滚到操作前的文件（或恢复备份）
+        local b = io.open(ROOT_BACKUP, "r")
+        if b then
+            local raw = b:read("*a") or ""
+            b:close()
+            local rf = io.open(ROOT_CONF, "w")
+            if rf then rf:write(raw); rf:close() end
+        else
+            os.remove(ROOT_CONF)
+        end
+        return { ok = false, err = "nginx 配置校验失败，已回滚: " .. trim(read_all("/tmp/glass-root-test.log") or "") }
+    end
+    run("nginx -s reload >/dev/null 2>&1")
+    if enable then
+        os.remove(ROOT_DISABLED_FLAG)
+    else
+        local df = io.open(ROOT_DISABLED_FLAG, "w")
+        if df then df:write("1\n"); df:close() end
+    end
+    return { ok = true, enabled = enable }
+end
+
+-- =====================================================================
+-- 手动安装插件包（界面：应用 → 插件管理 → 手动安装）
+--   pkg_upload_begin/chunk/finish  分片上传 ipk 到 /tmp
+--   pkg_install                    后台 opkg install，写日志 /tmp/glass-pkg-<id>.log
+--   pkg_install_status             轮询日志/退出码
+--   pkg_apps                       已安装的 LuCI 插件（应用菜单动态入口）
+-- =====================================================================
+local PKG_PREFIX = "/tmp/glass-pkg-"
+
+M.pkg_upload_begin = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    if id == "" then return { ok = false, err = "非法 ID" } end
+    local f = io.open(PKG_PREFIX .. id .. ".part", "wb")
+    if not f then return { ok = false, err = "无法写入 /tmp" } end
+    f:close()
+    return { ok = true, id = id }
+end
+
+M.pkg_upload_chunk = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    local data = tostring(params and params.data or "")
+    if id == "" or data == "" then return { ok = false, err = "参数不完整" } end
+    local f = io.open(PKG_PREFIX .. id .. ".part", "ab")
+    if not f then return { ok = false, err = "写入失败" } end
+    f:write(b64decode(data))
+    f:close()
+    return { ok = true }
+end
+
+M.pkg_upload_finish = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    if id == "" then return { ok = false, err = "非法 ID" } end
+    local part = PKG_PREFIX .. id .. ".part"
+    local dst = PKG_PREFIX .. id .. ".ipk"
+    local ok, err = os.rename(part, dst)
+    if not ok then return { ok = false, err = tostring(err or "保存失败") } end
+    run("chmod 644 '" .. dst .. "' 2>/dev/null")
+    return { ok = true, id = id, size = tonumber(run("wc -c < '" .. dst .. "' 2>/dev/null")) or 0 }
+end
+
+M.pkg_install = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    if id == "" then return { ok = false, err = "非法 ID" } end
+    local ipk = PKG_PREFIX .. id .. ".ipk"
+    local log = PKG_PREFIX .. id .. ".log"
+    local size = tonumber(run("wc -c < '" .. ipk .. "' 2>/dev/null")) or 0
+    if size < 100 then return { ok = false, err = "安装包为空，请重新上传" } end
+    run("rm -f '" .. log .. "'")
+    os.execute(string.format("( opkg install --force-reinstall '%s' > '%s' 2>&1; echo \"__GLASS_DONE__:$?\" >> '%s'; rm -f '%s' ) >/dev/null 2>&1 &",
+        ipk, log, log, ipk))
+    return { ok = true, id = id, log = log }
+end
+
+M.pkg_install_status = function(params)
+    local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
+    local log = PKG_PREFIX .. id .. ".log"
+    local text = read_all(log) or ""
+    local code = tonumber(text:match("__GLASS_DONE__:(%d+)"))
+    return { id = id, log = text, done = code ~= nil, code = code }
+end
+
+--- @object-method: pkg_apps
+M.pkg_apps = function()
+    local apps = {}
+    local labels = {
+        openclash = "OpenClash", passwall = "PassWall", ["passwall2"] = "PassWall2",
+        ssrplus = "SSR Plus", homeproxy = "HomeProxy",
+    }
+    local known = {
+        openclash = "/cgi-bin/luci/admin/services/openclash",
+        passwall = "/cgi-bin/luci/admin/services/passwall",
+        ["passwall2"] = "/cgi-bin/luci/admin/services/passwall2",
+        ssrplus = "/cgi-bin/luci/admin/services/shadowsocksr",
+        homeproxy = "/cgi-bin/luci/admin/services/homeproxy",
+    }
+    -- 只收「服务类」LuCI 插件（admin/services），避免把 firewall/mtk/opkg 等系统应用也塞进应用菜单
+    local function service_url(short)
+        local candidates = {
+            "/usr/lib/lua/luci/controller/" .. short .. ".lua",
+            "/usr/lib/lua/luci/controller/" .. short:gsub("%-", "_") .. ".lua",
+        }
+        for _, path in ipairs(candidates) do
+            local f = io.open(path, "r")
+            if f then
+                local s = f:read("*a") or ""
+                f:close()
+                local block = s:match("entry%(%{([^}]*)}")
+                if block then
+                    local segs = {}
+                    for q in block:gmatch('"([^"]+)"') do segs[#segs + 1] = q end
+                    local p = table.concat(segs, "/")
+                    if p:match("^admin/services") then
+                        return "/cgi-bin/luci/" .. p
+                    end
+                end
+            end
+        end
+        return known[short]
+    end
+    local out = run("opkg list-installed 2>/dev/null")
+    for name, ver in out:gmatch("([%w%._%+%-]+)%s+%-%s+([^\n]+)") do
+        local short = name:match("^luci%-app%-(.+)$")
+        if short then
+            local url = service_url(short)
+            if url then
+                apps[#apps + 1] = {
+                    package = name,
+                    label = labels[short] or short,
+                    version = ver:gsub("%s+$", ""),
+                    url = url,
+                }
+            end
+        end
+    end
+    table.sort(apps, function(a, b) return a.label < b.label end)
+    return { apps = apps }
+end
+
+-- =====================================================================
+-- 已安装应用的「原生」面板页（不嵌套 LuCI）
+--   app_detail  包信息 + 服务状态 + OpenClash 关键配置 + 最近日志
+--   app_action  启动/停止/重启/开机自启/关闭自启
+--   app_openclash_set  保存 OpenClash 运行模式/代理模式/控制面板等
+-- =====================================================================
+local function proc_has_cmd(needle)
+    local f = io.popen("ls /proc 2>/dev/null")
+    if not f then return false end
+    local found = false
+    for pid in f:lines() do
+        if pid:match("^%d+$") then
+            local cf = io.open("/proc/" .. pid .. "/cmdline", "rb")
+            if cf then
+                local s = cf:read("*a") or ""
+                cf:close()
+                if s:find(needle, 1, true) then
+                    found = true
+                    break
+                end
+            end
+        end
+    end
+    f:close()
+    return found
+end
+
+local function pkg_field(status, key)
+    local v = status:match("\n" .. key .. ":%s*([^\n]*)") or status:match("^" .. key .. ":%s*([^\n]*)")
+    return v and v:gsub("%s+$", "") or ""
+end
+
+local function file_exists(path)
+    local f = io.open(path, "r")
+    if f then f:close(); return true end
+    return false
+end
+
+M.app_detail = function(params)
+    local pkg = tostring(params and params.package or "")
+    if not pkg:match("^[%w%._%+%-]+$") then return { ok = false, err = "包名不合法" } end
+    local short = pkg:gsub("^luci%-app%-", "")
+    local status = run("opkg status '" .. pkg .. "' 2>/dev/null")
+    if status == "" then return { ok = false, err = "插件未安装或 opkg 查询失败" } end
+    local svc = ""
+    for _, p in ipairs({ "/etc/init.d/" .. short, "/etc/init.d/" .. pkg }) do
+        if file_exists(p) then svc = p break end
+    end
+    local running = false
+    local core_present = file_exists("/etc/openclash/clash")
+    local core_downloading = proc_has_cmd("openclash_core.sh") or proc_has_cmd("clash_meta.tar.gz")
+    if short == "openclash" then
+        -- 只认真正的内核进程；openclash_core.sh / curl 下载不算“运行中”
+        running = core_present and proc_has_cmd("/etc/openclash/clash")
+    elseif svc ~= "" then
+        running = (run("'" .. svc .. "' status 2>/dev/null"):find("running") ~= nil) or proc_has_cmd(short)
+    end
+    local enabled = svc ~= "" and run("ls /etc/rc.d/S*" .. short .. " 2>/dev/null") ~= ""
+    local log = ""
+    if short == "openclash" then
+        log = run("tail -n 60 /tmp/openclash.log 2>/dev/null")
+        if log == "" then log = run("tail -n 40 /tmp/openclash_start.log 2>/dev/null") end
+    else
+        log = run("logread -e '" .. short .. "' 2>/dev/null | tail -n 40")
+    end
+    local detail = {
+        ok = true,
+        package = pkg,
+        short = short,
+        version = pkg_field(status, "Version"),
+        arch = pkg_field(status, "Architecture"),
+        size = pkg_field(status, "Installed-Size"),
+        description = pkg_field(status, "Description"),
+        status = pkg_field(status, "Status"),
+        depends = pkg_field(status, "Depends"),
+        service = { script = svc, running = running, enabled = enabled },
+        core_present = core_present,
+        core_downloading = core_downloading,
+        log = log,
+    }
+    if short == "openclash" then
+        local u = function(k) return trim(run("uci -q get openclash.config." .. k .. " 2>/dev/null")) end
+        detail.openclash = {
+            enable = u("enable") == "1",
+            en_mode = u("en_mode"),
+            proxy_mode = u("proxy_mode"),
+            cn_port = (u("cn_port") ~= "" and u("cn_port")) or "9090",
+            http_port = u("http_port"),
+            socks_port = u("socks_port"),
+            mixed_port = u("mixed_port"),
+            proxy_port = u("proxy_port"),
+            dns_port = u("dns_port"),
+            core_version = u("core_version"),
+            dashboard_type = u("default_dashboard"),
+            dashboard_password = u("dashboard_password"),
+            config_present = file_exists("/etc/openclash/config/config.yaml")
+                or file_exists("/etc/openclash/config.yaml")
+                or file_exists("/etc/openclash/config/config.yml"),
+        }
+    end
+    return detail
+end
+
+M.app_action = function(params)
+    local pkg = tostring(params and params.package or "")
+    local action = tostring(params and params.action or "")
+    local short = pkg:gsub("^luci%-app%-", "")
+    if not pkg:match("^[%w%._%+%-]+$") then return { ok = false, err = "包名不合法" } end
+    if not ({ start = true, stop = true, restart = true, enable = true, disable = true })[action] then
+        return { ok = false, err = "未知操作" }
+    end
+    local svc = ""
+    for _, p in ipairs({ "/etc/init.d/" .. short, "/etc/init.d/" .. pkg }) do
+        if file_exists(p) then svc = p break end
+    end
+    if svc == "" then return { ok = false, err = "该插件没有可控制的 init 服务" } end
+    if short == "openclash" and action == "start" and not file_exists("/etc/openclash/clash") then
+        return { ok = false, err = "OpenClash 内核尚未安装，请先安装内核后再启动" }
+    end
+    run("'" .. svc .. "' " .. action .. " >/tmp/glass-app-action.log 2>&1")
+    return { ok = true, message = run("tail -n 3 /tmp/glass-app-action.log 2>/dev/null") }
+end
+
+M.app_openclash_set = function(params)
+    local p = params or {}
+    local function setk(k, v)
+        if v == nil or v == "" then return end
+        run("uci -q set openclash.config." .. k .. "='" .. tostring(v):gsub("'", "") .. "'")
+    end
+    local mode = tostring(p.en_mode or "")
+    local proxy = tostring(p.proxy_mode or "")
+    local dash = tostring(p.dashboard_type or "")
+    local enable = p.enable
+    if mode ~= "" and not ({ ["fake-ip"] = true, ["redir-host"] = true, ["tproxy"] = true, realip = true })[mode] then
+        return { ok = false, err = "运行模式不合法" }
+    end
+    if proxy ~= "" and not ({ rule = true, global = true, direct = true })[proxy] then
+        return { ok = false, err = "代理模式不合法" }
+    end
+    if dash ~= "" and not ({ Official = true, metacubexd = true, zashboard = true })[dash] then
+        return { ok = false, err = "控制面板类型不合法" }
+    end
+    setk("en_mode", mode)
+    setk("operation_mode", mode)
+    setk("proxy_mode", proxy)
+    setk("default_dashboard", dash)
+    if enable ~= nil then
+        setk("enable", (enable == true or enable == 1 or enable == "1") and "1" or "0")
+    end
+    run("uci -q commit openclash")
+    if enable ~= nil then
+        if enable == true or enable == 1 or enable == "1" then
+            run("/etc/init.d/openclash start >/tmp/glass-app-action.log 2>&1")
+        else
+            run("/etc/init.d/openclash stop >/tmp/glass-app-action.log 2>&1")
+        end
+    else
+        run("/etc/init.d/openclash restart >/tmp/glass-app-action.log 2>&1")
+    end
+    return { ok = true }
+end
+
+return M

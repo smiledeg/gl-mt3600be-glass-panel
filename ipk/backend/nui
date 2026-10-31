@@ -1,0 +1,474 @@
+-- NUI 桥 RPC 对象（GL SDK4 /rpc 通道）
+-- 部署到 /usr/lib/oui-httpd/rpc/nui，由 gl-ngx 的 oui.rpc 以 dofile 加载。
+--
+-- 作用：把 NUI 插件（luci-app-nradio-nui）的后端 Lua 模块 luci.nui.m_* 整体搬到
+-- GL 官方 /rpc 会话之后，前端只调 `nui.invoke({method=..., args=...})` 即可复用插件的
+-- 全部后端逻辑，不需要 /cgi-bin/luci/nui/api/<method>（本机 nginx 不跑 LuCI CGI）。
+--
+-- 鉴权：由 gl-ngx /rpc 的 session/login 负责（无 sid 调不通），本文件不另做认证。
+-- ctx 结构：{ sid = <gl-session sid>, session = <gl-session 数据>, method = "POST" }
+--
+-- 方法：
+--   nui.ping()      -> { ok=true, version=... }         探活
+--   nui.methods()   -> { ok=true, data={version,count,methods={{name,module,write,public}},errors={}} }
+--   nui.invoke(p)   -> { ok=true, data=<模块返回> } | { ok=false, code=..., error=... }
+--                      p = { method = "<NUI 方法名>", args = { ... } }
+
+local M = {}
+
+local VERSION = "1.0.0"
+
+-- 与 luci.nui.api 的 MODULES 保持一致（home/cnspeed/monitor/certgen 是辅助模块，由各模块按需 require）
+local MODULES = {
+	"luci.nui.m_core",
+	"luci.nui.m_status",
+	"luci.nui.m_cellular",
+	"luci.nui.m_network",
+	"luci.nui.m_wifi",
+	"luci.nui.m_system",
+	"luci.nui.m_diag",
+	"luci.nui.m_enhance",
+	"luci.nui.m_adv",
+	"luci.nui.m_cellcfg",
+	"luci.nui.m_at",
+	"luci.nui.m_speed",
+	"luci.nui.m_https",
+}
+
+local function log(level, msg)
+	msg = "nui-bridge: " .. tostring(msg)
+	if ngx and ngx.log then
+		ngx.log(level, msg)
+	else
+		io.stderr:write(msg .. "\n")
+	end
+end
+
+---------------------------------------------------------------------------
+-- 1. luci.http 兼容层
+-- nginx 里没有 CGI 请求上下文，luci.http.getcookie/getenv/formvaluetable 等会去读
+-- context.request（nil）而抛错。NUI 模块只在 m_core（登录/登出）和 m_speed.get_config
+-- 里用到这些函数，桥里把它们包成安全版本：拿不到就返回 nil/空表，不打断方法执行。
+---------------------------------------------------------------------------
+local http_patched = false
+local http_safe = {} -- 已包装过的函数名（Lua 5.1 的函数不能挂字段，单独记）
+local function patch_http()
+	if http_patched then return true end
+	local ok, http = pcall(require, "luci.http")
+	if not ok or type(http) ~= "table" then
+		log(ngx and ngx.WARN, "luci.http 不可用: " .. tostring(http))
+		http_patched = true
+		return false
+	end
+	local fns = {
+		"getenv", "getcookie", "content", "formvalue", "formvaluetable",
+		"header", "prepare_content", "status", "write", "source", "redirect",
+	}
+	for _, k in ipairs(fns) do
+		local orig = http[k]
+		if type(orig) == "function" and not http_safe[k] then
+			http_safe[k] = true
+			http[k] = function(...)
+				local ok2, a, b = pcall(orig, ...)
+				if ok2 then return a, b end
+				-- formvaluetable 的调用方会 pairs() 它，给个空表更稳妥
+				if k == "formvaluetable" then return {} end
+				return nil
+			end
+		end
+	end
+	http_patched = true
+	return true
+end
+
+---------------------------------------------------------------------------
+-- 2. 模块加载（单个模块失败只记日志，不影响其它模块的方法）
+---------------------------------------------------------------------------
+local mod_cache = {}
+local load_error = {}
+
+local function load_module(name)
+	local cached = mod_cache[name]
+	if cached ~= nil then
+		if cached then return cached end
+		return nil
+	end
+	local ok, mod = pcall(require, name)
+	if ok and type(mod) == "table" then
+		mod_cache[name] = mod
+		return mod
+	end
+	mod_cache[name] = false
+	load_error[name] = tostring(mod)
+	log(ngx and ngx.ERR, "load " .. name .. " failed: " .. tostring(mod))
+	return nil
+end
+
+local methods_cache
+
+-- 统一禁用清单（内容在下方定义；先声明，供 collect() 引用）
+local BLOCKED
+
+---------------------------------------------------------------------------
+-- 桥补充方法：插件自己缺的读接口（不改 43KB 的 m_adv）
+-- adv.upnp_get：FE 需要显示 UPnP 当前状态；插件只有 adv.upnp_set。
+---------------------------------------------------------------------------
+local function bridge_upnp_get()
+	local ok_fs, fs = pcall(require, "nixio.fs")
+	if not ok_fs or not fs.access("/etc/config/upnpd") then
+		return { supported = false, enabled = false, available = false }
+	end
+	local ok_uci, uci = pcall(require, "luci.model.uci")
+	if not ok_uci then return { supported = false, enabled = false, error = "uci 不可用" } end
+	local ok_cur, c = pcall(function() return uci.cursor() end)
+	if not ok_cur or not c then return { supported = false, enabled = false, error = "uci 不可用" } end
+	local en = c:get("upnpd", "config", "enabled")
+	return {
+		supported = true,
+		enabled = en == "1",
+		enabled_raw = en,
+		available = true,
+	}
+end
+
+-- 桥自带的方法（和模块方法一起出现在 nui.methods() 里，module=nui-bridge）
+local BRIDGE_METHODS = {
+	["adv.upnp_get"] = { module = "nui-bridge", write = false, fn = bridge_upnp_get },
+}
+
+local function collect()
+	if methods_cache then return methods_cache end
+	local all, names = {}, {}
+	for _, modname in ipairs(MODULES) do
+		local mod = load_module(modname)
+		if mod then
+			local short = modname:match("luci%.nui%.(.+)$") or modname
+			for k, v in pairs(mod) do
+				-- 只认 { fn = function, ... } 这种标准方法项；纯数据表不暴露
+				if type(v) == "table" and type(v.fn) == "function" then
+					if all[k] then
+						log(ngx and ngx.WARN, "方法名重复: " .. tostring(k) .. "（" .. short .. " 覆盖前一个）")
+					end
+					all[k] = {
+						name = k,
+						module = short,
+						write = v.write == true,
+						public = v.public == true,
+						fn = v.fn,
+					}
+					names[#names + 1] = k
+				end
+			end
+		end
+	end
+	-- 桥补充方法（插件没有的读接口）
+	local plugin_count = #names
+	for k, v in pairs(BRIDGE_METHODS) do
+		if all[k] then
+			log(ngx and ngx.WARN, "桥方法名与模块方法冲突: " .. tostring(k))
+		else
+			all[k] = { name = k, module = v.module, write = v.write == true, public = false, fn = v.fn }
+			names[#names + 1] = k
+		end
+	end
+	table.sort(names)
+	local list = {}
+	for _, k in ipairs(names) do
+		local m = all[k]
+		local e = { name = m.name, module = m.module, write = m.write, public = m.public }
+		if BLOCKED[k] then
+			e.blocked = true
+			e.reason = BLOCKED[k]
+		end
+		list[#list + 1] = e
+	end
+	-- 桥自身的便利方法（直接 call nui.caps，不走 invoke）
+	list[#list + 1] = { name = "caps", module = "bridge", write = false, public = false, direct = true }
+	methods_cache = { list = list, by_name = all, plugin_count = plugin_count }
+	return methods_cache
+end
+
+---------------------------------------------------------------------------
+-- 3. 请求上下文
+---------------------------------------------------------------------------
+local function build_ctx()
+	local ctx = { method = "POST" }
+	if ngx and ngx.ctx then ctx.sid = ngx.ctx.sid end
+	if ngx and ngx.var then ctx.remote_addr = ngx.var.remote_addr end
+
+	if ctx.sid then
+		local session
+		-- 优先走原生 ubus（luci.util.ubus），失败再退回 gl-ngx 的 oui.ubus
+		local ok_u, util = pcall(require, "luci.util")
+		if ok_u and type(util) == "table" and type(util.ubus) == "function" then
+			local ok2, s = pcall(util.ubus, "gl-session", "session", { sid = ctx.sid })
+			if ok2 and type(s) == "table" and next(s) ~= nil then session = s end
+		end
+		if not session then
+			local ok, ubus = pcall(require, "oui.ubus")
+			if ok and type(ubus) == "table" and type(ubus.call) == "function" then
+				local ok2, s = pcall(ubus.call, "gl-session", "session", { sid = ctx.sid })
+				if ok2 and type(s) == "table" and next(s) ~= nil then session = s end
+			end
+		end
+		if session then
+			local copy = {}
+			for k, v in pairs(session) do copy[k] = v end
+			-- GL 会话没有 NUI 的 token/plaintext；桥不做 CSRF 校验，
+			-- 补 plaintext 是为了让 m_core.session 不去写 ubus 会话（保持只读）
+			if copy.plaintext == nil then copy.plaintext = "1" end
+			ctx.session = copy
+			ctx.user = copy.username or copy.user
+			ctx.aclgroup = copy.aclgroup
+		end
+	end
+	if not ctx.session then ctx.session = { plaintext = "1", user = "root" } end
+	return ctx
+end
+
+local function clean_err(e)
+	return (tostring(e):gsub("^.-:%d+: ", ""))
+end
+
+-- NUI 是给 原厂固件写的；GL 4.9 上没有 厂商 的 luci.nradio / cpetools.sh / infocd，
+-- 相关方法会报模块缺失；本机也没有蜂窝模组（补丁模块会返回中文提示）。
+-- 统一翻成 UNSUPPORTED，前端按"能力不可用"降级，不必解析 Lua 报错。
+local function classify(err)
+	local s = clean_err(err)
+	if s:find("luci%.nradio", 1, false) or s:find("luci/nradio", 1, false) then
+		return "UNSUPPORTED",
+			"该功能依赖 原厂固件专有模块 luci.nradio，GL 4.9 不支持（请前端降级或改用官方 RPC 接口）"
+	end
+	if s:find("未检测到蜂窝模组", 1, false) then
+		return "UNSUPPORTED", s
+	end
+	if s:find("cpetools", 1, false) or s:find("厂商 蜂窝配置体系", 1, false) then
+		return "UNSUPPORTED", s
+	end
+	return "ERROR", s
+end
+
+---------------------------------------------------------------------------
+-- 统一禁用的方法：原样转发会改坏设备/与 GL 官方状态打架，桥里直接拒绝。
+-- methods() 里带 blocked=true + reason，前端可提前置灰。
+---------------------------------------------------------------------------
+BLOCKED = {
+	["login"] = "请使用 GL 官方 /rpc 登录（桥在已登录会话下调用），插件登录接口禁用",
+	["logout"] = "退出请用 GL 官方 /rpc logout，插件登出接口禁用",
+	["ui.set_default"] = "首页接管由本后台自己的部署负责，禁用插件实现",
+	["ui.skin_set"] = "GL 没有 厂商 主题目录 themes/nradio，原厂界面美化不可用",
+	["at.imei_set"] = "写 IMEI 风险高，禁用；只读 IMEI 请用官方 modem / gl_modem AT+CGSN",
+	["at.imei_restore"] = "写 IMEI 风险高，禁用",
+	["app.progress"] = "禁用；安装进度请用官方 plugins.* / opkg 日志",
+	["enh.fan_commander_restore"] = "GL 没有 fan_commander 服务，禁用；风扇用官方 fanctrl",
+	-- 追加禁用：插件写的是 uhttpd(8443) 的证书/监听与强制跳转，会与 GL 官方 nginx(443)/uhttpd 状态冲突
+	["https.generate"] = "GL 的 HTTPS 由官方 nginx(443)/uhttpd(8443) 管理，插件写 uhttpd 会与官方冲突，禁用",
+	["https.install"] = "GL 的 HTTPS 由官方 nginx(443)/uhttpd(8443) 管理，插件写 uhttpd 会与官方冲突，禁用",
+	["https.set"] = "GL 的 HTTPS 由官方 nginx(443)/uhttpd(8443) 管理，插件写 uhttpd 会与官方冲突，禁用",
+}
+
+---------------------------------------------------------------------------
+-- nui.caps：设备能力探测（前端据此决定每个卡片显示可用/不可用）
+---------------------------------------------------------------------------
+local function fs_ok(path)
+	local ok, fs = pcall(require, "nixio.fs")
+	if not ok then return false end
+	local ok2, r = pcall(fs.access, path)
+	return ok2 and r == true
+end
+
+local function read_file(path)
+	local ok, fs = pcall(require, "nixio.fs")
+	if not ok then return nil end
+	local ok2, r = pcall(fs.readfile, path)
+	return ok2 and r or nil
+end
+
+-- 某个 TCP 端口是否在 LISTEN（解析 /proc/net/tcp{,6}；用于判断 https 443）
+local function port_listening(port)
+	local hex = string.format(":%04X", port)
+	for _, f in ipairs({ "/proc/net/tcp", "/proc/net/tcp6" }) do
+		local text = read_file(f)
+		if text then
+			for line in text:gmatch("[^\n]+") do
+				local fields = {}
+				for w in line:gmatch("%S+") do fields[#fields + 1] = w end
+				local local_addr, st = fields[2], fields[4]
+				if local_addr and st == "0A" and local_addr:sub(-5):upper() == hex then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+function M.caps()
+	local caps = { diag = {} }
+	-- 蜂窝：/dev 设备节点 + 官方 cellular.sim 列表
+	local modem = false
+	local ok_fs, fs = pcall(require, "nixio.fs")
+	if ok_fs then
+		local prefixes = { "^ttyUSB", "^cdc%-wdm", "^mhi", "^wwan" }
+		local ok_dir, dir = pcall(fs.dir, "/dev")
+		if ok_dir and dir then
+			for name in dir do
+				for _, pat in ipairs(prefixes) do
+					if name:match(pat) then modem = true end
+				end
+			end
+		end
+	end
+	local sims = 0
+	local board = {}
+	-- 用 luci.util.ubus（原生 ubus 绑定）：oui.ubus 走 ngx-ubus-proxy，对 system/cellular 类对象不一定放行
+	local ok_util, util = pcall(require, "luci.util")
+	if ok_util and type(util) == "table" and type(util.ubus) == "function" then
+		local okb, b = pcall(util.ubus, "system", "board", {})
+		if okb and type(b) == "table" then board = b end
+		local oks, s = pcall(util.ubus, "cellular.sim", "info", {})
+		if oks and type(s) == "table" and type(s.sims) == "table" then sims = #s.sims end
+	end
+	caps.modem = modem
+	caps.cellular = modem
+	caps.sim = sims > 0
+	caps.cellular_stack = fs_ok("/usr/lib/oui-httpd/rpc/modem.so") -- 固件带蜂窝栈，不代表插了模组
+	caps.sms = modem -- GL 短信接口是 modem.get_sms_list/send_sms，需要模组
+	caps.sms_api = fs_ok("/usr/lib/oui-httpd/rpc/modem.so")
+	-- 风扇 / 灯 / SSH / HTTPS / 测速 / 诊断
+	caps.fan = fs_ok("/etc/config/gl_fanctrl") or fs_ok("/sys/class/hwmon/hwmon0")
+	caps.fanctrl = fs_ok("/usr/lib/oui-httpd/rpc/fanctrl")
+	caps.led = fs_ok("/etc/config/gl_led")
+	caps.ssh = fs_ok("/var/run/dropbear.pid") or fs_ok("/etc/init.d/dropbear")
+	caps.https = port_listening(443)
+	caps.uhttpd = fs_ok("/etc/init.d/uhttpd")
+	caps.speed = fs_ok("/usr/libexec/nui-speedtest")
+	caps.speed_cgi = fs_ok("/www/cgi-bin/nui-speed")
+	caps.speed_http = fs_ok("/usr/libexec/nui-speed-http")
+	caps.diag.ping = fs_ok("/bin/ping") or fs_ok("/usr/bin/ping")
+	caps.diag.traceroute = fs_ok("/usr/sbin/traceroute") or fs_ok("/usr/bin/traceroute")
+	caps.diag.nslookup = fs_ok("/usr/bin/nslookup") or fs_ok("/bin/nslookup")
+	caps.diag.curl = fs_ok("/usr/bin/curl")
+	caps.ttl = fs_ok("/proc/sys/net/ipv4/ip_default_ttl")
+	caps.upnp = fs_ok("/etc/config/upnpd")
+	caps.mwan3 = fs_ok("/usr/sbin/mwan3")
+	caps.nui_lua = fs_ok("/usr/lib/lua/luci/nui/api.lua")
+	caps.nradio_shim = fs_ok("/usr/lib/lua/luci/nradio.lua")
+	-- 无线频段 / 中继（按 netdev 名判断：MTK ra0=2.4G，rai0=5G，apclii0=中继）
+	caps.wifi_2g = false
+	caps.wifi_5g = false
+	caps.repeater = false
+	if ok_fs then
+		local ok_dir2, dir2 = pcall(fs.dir, "/sys/class/net")
+		if ok_dir2 and dir2 then
+			for name in dir2 do
+				if name:match("^rai%d") then
+					caps.wifi_5g = true
+				elseif name:match("^ra%d") then
+					caps.wifi_2g = true
+				elseif name:match("^apcli") then
+					caps.repeater = true
+				end
+			end
+		end
+	end
+	return {
+		version = VERSION,
+		device = {
+			model = board.model,
+			hostname = board.hostname,
+			board = board.board,
+			target = board.target,
+			release = board.release and board.release.description,
+		},
+		blocked = BLOCKED,
+		caps = caps,
+	}
+end
+
+---------------------------------------------------------------------------
+-- 4. 对外方法（oui.rpc 只收返回值里的 function，签名统一为 fn(args)）
+---------------------------------------------------------------------------
+function M.ping()
+	return { ok = true, version = VERSION }
+end
+
+function M.methods()
+	local c = collect()
+	local errors
+	for k, v in pairs(load_error) do
+		errors = errors or {}
+		errors[k] = v
+	end
+	return {
+		ok = true,
+		data = {
+			version = VERSION,
+			count = #c.list,
+			plugin_count = c.plugin_count,
+			methods = c.list,
+			blocked = BLOCKED,
+			errors = errors,
+		},
+	}
+end
+
+function M.invoke(params)
+	if type(params) ~= "table" then
+		return { ok = false, code = "INVALID", error = "参数必须是对象" }
+	end
+
+	local name = params.method
+	if type(name) ~= "string" or name == "" then
+		return { ok = false, code = "INVALID", error = "缺少 method" }
+	end
+
+	-- args 支持两种写法：{method, args={...}} 与 {method, k=v,...} 平铺
+	local args = params.args
+	if type(args) ~= "table" then
+		args = {}
+		for k, v in pairs(params) do
+			if k ~= "method" and k ~= "args" then args[k] = v end
+		end
+	end
+
+	-- 兼容层自身出错也不能让 /rpc 返回 500（否则前端拿不到任何错误信息）
+	pcall(patch_http)
+
+	-- 桥自身的便利方法（也可直接 call nui.caps）
+	if name == "caps" then
+		local okcaps, data = pcall(M.caps)
+		if okcaps then return { ok = true, data = data } end
+		return { ok = false, code = "ERROR", error = clean_err(data) }
+	end
+
+	-- 统一禁用清单：不转发，直接给前端明确原因
+	local blocked = BLOCKED[name]
+	if blocked then
+		return { ok = false, code = "UNSUPPORTED", error = blocked }
+	end
+
+	local c = collect()
+	local entry = c.by_name[name]
+	if not entry then
+		return { ok = false, code = "NOTFOUND", error = "未知接口: " .. name }
+	end
+
+	local ctx = build_ctx()
+	local ok, data, err = pcall(entry.fn, args, ctx)
+	if not ok then
+		local code, msg = classify(data)
+		log(ngx and ngx.ERR, name .. ": " .. tostring(data))
+		return { ok = false, code = code, error = msg }
+	end
+	if data == nil and err ~= nil then
+		local code, msg = classify(err)
+		return { ok = false, code = code, error = msg }
+	end
+	return { ok = true, data = data }
+end
+
+-- invoke 的别名，方便前端写成 nui.call(...)
+M.call = M.invoke
+
+return M

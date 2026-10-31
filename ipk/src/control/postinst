@@ -1,0 +1,87 @@
+#!/bin/sh
+# Glass Panel v3 - postinst
+DESCRIPT="Glass Panel v3"
+BACKUP=/etc/glass-nui-backup
+
+# 1. 权限兜底（opkg 已按打包权限落地，这里再刷一遍）
+chmod -R a+rX /www/glass 2>/dev/null || true
+chmod 644 /usr/lib/oui-httpd/rpc/glass 2>/dev/null || true
+chmod 644 /usr/lib/oui-httpd/rpc/nui 2>/dev/null || true
+chmod 644 /etc/nginx/gl-conf.d/zz-glass.conf 2>/dev/null || true
+chmod 644 /etc/nginx/gl-conf.d/zz-glass-root.conf 2>/dev/null || true
+# 用户手动关闭过「默认后台」：升级时不要把根路径重新接管
+if [ -f /etc/glass-root-disabled ]; then
+    rm -f /etc/nginx/gl-conf.d/zz-glass-root.conf
+fi
+chmod 644 /usr/lib/lua/luci/nradio.lua 2>/dev/null || true
+chmod 644 /usr/share/gl-validator.d/glass.lua 2>/dev/null || true
+# 内置的 NUI 最小后端运行时（面板测速/诊断/监控/SSH 依赖）
+chmod 644 /usr/lib/lua/luci/nui/*.lua 2>/dev/null || true
+chmod 755 /usr/libexec/nui-dlbench /usr/libexec/nui-exptest /usr/libexec/nui-https-local \
+          /usr/libexec/nui-speed-http /usr/libexec/nui-speedtest /usr/libexec/nui-wifiscan 2>/dev/null || true
+chmod 755 /www/cgi-bin/nui-speed 2>/dev/null || true
+
+# 2. 清掉 v1/v2 时代的旧前端文件（旧版把 js/css 放在 /www/glass 根下）
+rm -rf /www/glass/js /www/glass/css 2>/dev/null || true
+
+# 3. 老版本遗留：若 NUI 插件前端已删（/www/nui 不存在）但 nginx 片段还在，
+#    /nui/ 会内部重定向循环（500/302 抖动），这里顺手清掉
+if [ ! -d /www/nui ] && [ -f /etc/nginx/gl-conf.d/zz-nui.conf ]; then
+    rm -f /etc/nginx/gl-conf.d/zz-nui.conf
+    echo "$DESCRIPT: 已清理遗留的 zz-nui.conf（前端文件已不存在）"
+fi
+
+# 3b. NUI 运行时检查：桥对象需要 /usr/lib/lua/luci/nui 下的 Lua 模块（本包自带）
+if [ ! -f /usr/lib/lua/luci/nui/m_cellular.lua ]; then
+    echo "$DESCRIPT: NOTE 未检测到 NUI 后端运行时（/usr/lib/lua/luci/nui）。"
+    echo "           面板的测速/诊断/监控/SSH 等增强页会显示“运行时未安装”，"
+    echo "           其余官方功能不受影响。"
+fi
+
+
+# 4b. 首页速率历史服务（默认关闭，开关在 界面设置 → 首页）
+[ -f /etc/config/glass ] || {
+    cat > /etc/config/glass <<'EOF'
+config glass 'glass'
+	option rate_history '0'
+EOF
+}
+uci -q get glass.glass >/dev/null 2>&1 || uci -q set glass.glass=glass
+uci -q get glass.glass.rate_history >/dev/null 2>&1 || uci -q set glass.glass.rate_history='0'
+uci -q commit glass 2>/dev/null || true
+chmod 755 /usr/bin/glass-rate /etc/init.d/glass-rate 2>/dev/null || true
+if [ "$(uci -q get glass.glass.rate_history 2>/dev/null)" = "1" ]; then
+    /etc/init.d/glass-rate enable >/dev/null 2>&1 || true
+    /etc/init.d/glass-rate restart >/dev/null 2>&1 || true
+fi
+# 4. 校验 nginx 配置并热重载
+if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/tmp/glass-nginx-test.log 2>&1; then
+        nginx -s reload >/dev/null 2>&1 || echo "$DESCRIPT: WARN nginx reload failed."
+    else
+        echo "$DESCRIPT: WARN nginx config test failed:"
+        cat /tmp/glass-nginx-test.log
+    fi
+fi
+
+# 5. 自检
+sleep 1
+echo "$DESCRIPT: self-check"
+echo -n "  /                 -> "; curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" http://127.0.0.1/ 2>/dev/null || echo "n/a"
+echo -n "  /glass/index.html -> "; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1/glass/index.html 2>/dev/null || echo "n/a"
+ASSET=$(ls /www/glass/assets/*.js 2>/dev/null | head -1)
+if [ -n "$ASSET" ]; then
+    echo -n "  /glass/assets/js  -> "
+    curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1/glass/assets/$(basename "$ASSET")" 2>/dev/null || echo "n/a"
+fi
+echo -n "  /gl_home.html     -> "; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1/gl_home.html 2>/dev/null || echo "n/a"
+echo -n "  /nui/ (可选)      -> "; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1/nui/ 2>/dev/null || echo "n/a"
+echo -n "  rpc/glass         -> "; [ -f /usr/lib/oui-httpd/rpc/glass ] && echo present || echo missing
+echo -n "  rpc/nui           -> "; [ -f /usr/lib/oui-httpd/rpc/nui ] && echo present || echo missing
+echo -n "  nui 运行时        -> "; [ -d /usr/lib/lua/luci/nui ] && echo present || echo missing
+
+echo "$DESCRIPT: installed."
+echo "  高级后台: http://<router-ip>/   (自动跳转 /glass/；如未接管则 /glass/index.html)"
+echo "  GL 官方后台: http://<router-ip>/gl_home.html"
+echo "  OpenWrt LuCI: http://<router-ip>/cgi-bin/luci/"
+exit 0

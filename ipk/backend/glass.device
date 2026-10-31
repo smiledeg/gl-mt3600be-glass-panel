@@ -1,0 +1,452 @@
+--[[
+    @object-name: glass
+    @object-desc: 高级后台（Glass Panel）专用只读 RPC —— 补齐官方 system/wifi/clients
+                  模块没有暴露的实时指标：CPU 占用率、各温度传感器、风扇转速、
+                  磁盘占用、运行时间、系统时间。
+
+    调用示例：
+      POST /rpc
+      {"jsonrpc":"2.0","id":1,"method":"call",
+       "params":["<sid>","glass","get_status",{}]}
+
+    返回：
+      {
+        "uptime": 121882,                 -- 秒
+        "localtime": 1792448429,          -- 秒
+        "load": [1.25, 0.90, 0.51],
+        "cpu": [12.3, 8.1, 5.0, 4.4],     -- 各核占用率（首次调用为 null）
+        "cpu_avg": 7.4,
+        "memory": {"total":..,"used":..,"available":..,"free":..,"cached":..,"buffers":..},
+        "disk": {"total":..,"used":..,"available":..,"percent":..},
+        "temps": [{"name":"soc_thermal","temp":47.6}, ...],
+        "fan": {"speed": 2932, "status": true}
+      }
+
+    说明：本模块只读，不修改任何配置。CPU 占用率通过 /tmp 下保存的上一
+    次 /proc/stat 采样做差计算，因此首次调用返回 null，第二次起正常。
+--]]
+
+local M = {}
+
+local CPU_STATE = "/tmp/glass-cpu.stat"
+
+local function read_all(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+local function read_line(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*l")
+    f:close()
+    return s
+end
+
+-- ---------- CPU（总 + 各核） ----------
+local function cpu_percent()
+    local s = read_all("/proc/stat")
+    if not s then return {}, nil end
+
+    local cur = {}
+    for line in s:gmatch("cpu%d+[^\n]*") do
+        local vals = {}
+        for v in line:gmatch("%d+") do vals[#vals + 1] = tonumber(v) end
+        local total = 0
+        for i = 1, math.min(#vals, 8) do total = total + vals[i] end
+        local idle = (vals[4] or 0) + (vals[5] or 0)
+        cur[#cur + 1] = { total = total, idle = idle }
+    end
+
+    local prev = {}
+    local pf = io.open(CPU_STATE, "r")
+    if pf then
+        for line in pf:lines() do
+            local t, i = line:match("(%d+)%s+(%d+)")
+            if t then prev[#prev + 1] = { total = tonumber(t), idle = tonumber(i) } end
+        end
+        pf:close()
+    end
+
+    local out, sum, cnt = {}, 0, 0
+    for i, c in ipairs(cur) do
+        local p = prev[i]
+        local pct = nil
+        if p and c.total > p.total then
+            local dt = c.total - p.total
+            local di = c.idle - p.idle
+            pct = (dt - di) * 100 / dt
+            if pct < 0 then pct = 0 elseif pct > 100 then pct = 100 end
+            sum = sum + pct
+            cnt = cnt + 1
+        end
+        out[#out + 1] = pct
+    end
+
+    local wf = io.open(CPU_STATE, "w")
+    if wf then
+        for _, c in ipairs(cur) do wf:write(c.total, " ", c.idle, "\n") end
+        wf:close()
+    end
+
+    return out, cnt > 0 and (sum / cnt) or nil
+end
+
+-- ---------- 温度 ----------
+local function temperatures()
+    local out = {}
+    for i = 0, 5 do
+        local base = "/sys/class/thermal/thermal_zone" .. i
+        local t = read_line(base .. "/temp")
+        if t then
+            local name = read_line(base .. "/type") or ("zone" .. i)
+            local v = tonumber(t)
+            if v then
+                out[#out + 1] = { name = name, temp = math.floor(v / 100) / 10 }
+            end
+        end
+    end
+    return out
+end
+
+-- ---------- 风扇 ----------
+local function fan_status()
+    local res = { speed = 0, status = false }
+    local p = io.popen("for d in /sys/class/hwmon/hwmon*; do "
+        .. "n=$(cat $d/name 2>/dev/null); "
+        .. "[ \"$n\" = pwmfan ] && cat $d/fan1_input 2>/dev/null; done")
+    if p then
+        local v = p:read("*l")
+        p:close()
+        if v then res.speed = tonumber(v) or 0 end
+    end
+    if res.speed == 0 then
+        local v = read_line("/sys/class/fan/fan_speed")
+        if v then res.speed = tonumber((v:match("(%d+)"))) or 0 end
+    end
+    local state = read_line("/sys/class/thermal/cooling_device0/cur_state")
+    res.status = res.speed > 0 or (tonumber(state or "0") or 0) > 0
+    return res
+end
+
+-- ---------- 内存 ----------
+local function memory()
+    local s = read_all("/proc/meminfo")
+    if not s then return nil end
+    local function g(k)
+        local v = s:match(k .. ":%s+(%d+)")
+        return (tonumber(v) or 0) * 1024
+    end
+    local total = g("MemTotal")
+    local free = g("MemFree")
+    local available = g("MemAvailable")
+    local cached = g("Cached")
+    local buffers = g("Buffers")
+    return {
+        total = total,
+        free = free,
+        available = available,
+        cached = cached,
+        buffers = buffers,
+        used = total - available
+    }
+end
+
+-- ---------- 磁盘 ----------
+local function disk()
+    local p = io.popen("df -k /overlay 2>/dev/null | tail -n 1")
+    if not p then return nil end
+    local line = p:read("*l")
+    p:close()
+    if not line then return nil end
+    local total, used, avail, pct = line:match("^%S+%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%%")
+    if not total then return nil end
+    return {
+        total = (tonumber(total) or 0) * 1024,
+        used = (tonumber(used) or 0) * 1024,
+        available = (tonumber(avail) or 0) * 1024,
+        percent = tonumber(pct) or 0
+    }
+end
+
+-- ---------- 云服务（GL 官方 GoodCloud / DDNS / AstroWarp） ----------
+-- 说明：本方法只做「只读聚合」，把前端无法直接拿到的云端地址、固件区域、
+--       后台进程运行状态汇总返回；真正的开关/绑定仍走官方 cloud / ddns 对象，
+--       以免与官方 UI 产生两套状态。
+M.get_cloud_info = function(params)
+    local fw = (read_line("/etc/firmware_type") or ""):match("%S+") or ""
+    local cn = (fw == "2b")   -- 2b = 国内版（cloud.gl-inet.cn），2c/其它 = 国际版
+
+    local country = read_line("/proc/gl-hw-info/country_code") or ""
+
+    -- 注意：不能用 pgrep -f（会匹配到执行本命令的 shell 自身命令行），
+    --       这里用 -x 精确匹配进程名。
+    local function proc_running(name)
+        local p = io.popen("pgrep -x " .. name .. " 2>/dev/null | head -n 1")
+        if not p then return false end
+        local s = p:read("*l")
+        p:close()
+        return s ~= nil and s ~= ""
+    end
+
+    local function uci_get(key)
+        local p = io.popen("uci -q get " .. key .. " 2>/dev/null")
+        if not p then return nil end
+        local s = p:read("*l")
+        p:close()
+        if s == nil or s == "" then return nil end
+        return s
+    end
+
+    -- MQTT（云端长连接）是否在线：沿用官方 ubus 状态
+    local mqtt = nil
+    local p = io.popen("ubus call gl-cloud status 2>/dev/null")
+    if p then
+        local s = p:read("*a") or ""
+        p:close()
+        if s:match("\"connected\"%s*:%s*true") then mqtt = true
+        elseif s:match("\"connected\"%s*:%s*false") then mqtt = false end
+    end
+
+    return {
+        firmware_type = fw,
+        is_cn = cn,
+        country_code = country,
+        goodcloud_url = cn and "https://cloud.gl-inet.cn" or "https://www.goodcloud.xyz",
+        goodcloud_api = cn and "https://api.gl-inet.cn" or "https://api.goodcloud.xyz",
+        astrowarp_url = "https://my.astrowarp.net",
+        astrowarp_api = "https://api.astrowarp.net",
+        ddns_suffix = "glddns.com",
+        -- 官方 UI 中对应页面（hash 路由），用于「在官方后台打开」深链
+        ui_routes = {
+            cloud = "/gl_home.html#/cloud",
+            ddns = "/gl_home.html#/dynamicdns",
+            astrowarp = "/gl_home.html#/astrowarp"
+        },
+        remote_http_port = uci_get("gl_ddns.ddns.http_port") or "80",
+        remote_https_port = uci_get("gl_ddns.ddns.https_port") or "443",
+        -- 用 -x 精确匹配可执行文件名（编译后的二进制名就是 gl-cloud / rtty）
+        gl_cloud_running = proc_running("gl-cloud"),
+        rtty_running = proc_running("rtty"),
+        mptun_enable = uci_get("mptun.global.enable") == "1",
+        mqtt_connected = mqtt      -- nil = 服务未运行，无法判定
+    }
+end
+
+--[[
+    @method-name: get_status
+    @method-desc: 一次性返回面板所需的实时指标。
+    @out-example: 见文件头注释。
+--]]
+M.get_status = function(params)
+    local uptime = tonumber((read_line("/proc/uptime") or ""):match("^(%d+)")) or 0
+    local cpu, cpu_avg = cpu_percent()
+
+    local load = { 0, 0, 0 }
+    local la = read_line("/proc/loadavg")
+    if la then
+        local a, b, c = la:match("^(%S+)%s+(%S+)%s+(%S+)")
+        load = { tonumber(a) or 0, tonumber(b) or 0, tonumber(c) or 0 }
+    end
+
+    local hostname = read_line("/proc/sys/kernel/hostname") or ""
+
+    return {
+        uptime = uptime,
+        localtime = os.time(),
+        load = load,
+        hostname = hostname,
+        cpu = cpu,
+        cpu_avg = cpu_avg,
+        memory = memory(),
+        disk = disk(),
+        temps = temperatures(),
+        fan = fan_status()
+    }
+end
+
+
+--[[ ===================== 联网检测 / WAN 健康检查 / 静态路由 =====================
+     原厂 4.9 的 RPC 里没有「联网检测」，参考实现（luci-app-nradio-nui）
+     是自己在后端做：读默认路由 + 真 ping，配置读写 /etc/config/wanchk。
+     这里同样由本模块补齐，前端只调 glass.conn_check / wanchk_* / route_*。
+--]]
+
+local function run(cmd)
+    local f = io.popen(cmd .. " 2>/dev/null")
+    if not f then return "" end
+    local s = f:read("*a") or ""
+    f:close()
+    return s
+end
+
+local function trim(s)
+    if not s then return "" end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+--- 读默认路由：返回 iface, gateway
+local function default_route()
+    local out = run("ip -4 route show default")
+    local iface, gw = nil, nil
+    for line in out:gmatch("[^\r\n]+") do
+        gw = gw or line:match("via%s+([%d%.]+)")
+        iface = iface or line:match("dev%s+(%S+)")
+    end
+    return iface, gw
+end
+
+--- 单次 ping，返回 ok, 延迟ms
+local function ping_once(host, timeout)
+    local out = run(string.format("ping -c 1 -W %d %s", timeout or 2, host))
+    local t = out:match("time[=<]%s*([%d%.]+)%s*ms")
+    local got = out:match("(%d+)%s+received") or out:match("(%d+) packets received")
+    local ok = (t ~= nil) or (got ~= nil and tonumber(got) > 0)
+    return ok, t and tonumber(t) or nil
+end
+
+--- @object-method: conn_check
+--- 联网检测：默认路由 → 网关 → 外网（两个目标）→ DNS 解析
+M.conn_check = function(params)
+    local iface, gw = default_route()
+    local gw_ok, gw_ms = false, nil
+    if gw then gw_ok, gw_ms = ping_once(gw, 1) end
+
+    local online, latency, target = false, nil, nil
+    for _, host in ipairs({ "223.5.5.5", "1.1.1.1", "114.114.114.114" }) do
+        local ok, ms = ping_once(host, 2)
+        if ok then
+            online, latency, target = true, ms, host
+            break
+        end
+    end
+
+    local dns_ok = false
+    if online then
+        local out = run("nslookup www.baidu.com 2>/dev/null | head -20")
+        dns_ok = out:find("Address") ~= nil and #out > 20
+    end
+
+    local level = "down"
+    if online then
+        level = "ok"
+    elseif iface or gw_ok then
+        level = "link"
+    end
+
+    return {
+        online = online,
+        level = level,
+        iface = iface or "",
+        gateway = gw or "",
+        gateway_ok = gw_ok,
+        gateway_latency = gw_ms,
+        target = target or "",
+        latency = latency,
+        dns_ok = dns_ok,
+        checked_at = os.time(),
+        source = "glass.conn_check",
+    }
+end
+
+--- @object-method: wanchk_get
+M.wanchk_get = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { supported = false } end
+    local c = uci.cursor()
+    local out = { supported = true, profiles = {} }
+    c:foreach("wanchk", "wanchk", function(s)
+        out.profiles[#out.profiles + 1] = {
+            name = s[".name"],
+            interface = s.interface or "",
+            dnsopen = s.dnsopen ~= "0",
+            pingopen = s.pingopen ~= "0",
+            timeout = tonumber(s.timeout) or 0,
+            try_count = tonumber(s.try) or 0,
+        }
+    end)
+    return out
+end
+
+--- @object-method: wanchk_set
+M.wanchk_set = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { err_msg = "uci 不可用" } end
+    local c = uci.cursor()
+    local name = params.name
+    if not name then return { err_msg = "缺少 name" } end
+    c:set("wanchk", name, "dnsopen", params.dnsopen and "1" or "0")
+    c:set("wanchk", name, "pingopen", params.pingopen and "1" or "0")
+    if params.timeout then c:set("wanchk", name, "timeout", tostring(params.timeout)) end
+    if params.try_count then c:set("wanchk", name, "try", tostring(params.try_count)) end
+    c:commit("wanchk")
+    return { res = true }
+end
+
+--- 静态路由（UCI network route），仅 IPv4
+local function route_list(c)
+    local out = {}
+    c:foreach("network", "route", function(s)
+        out[#out + 1] = {
+            id = s[".name"],
+            target = s.target or "",
+            netmask = s.netmask or "",
+            gateway = s.gateway or "",
+            interface = s.interface or "",
+            enabled = s.disabled ~= "1",
+        }
+    end)
+    return out
+end
+
+M.route_list = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { supported = false, routes = {} } end
+    local c = uci.cursor()
+    local ifaces = {}
+    c:foreach("network", "interface", function(s)
+        ifaces[#ifaces + 1] = { name = s[".name"], ifname = s.ifname or "", proto = s.proto or "" }
+    end)
+    return { supported = true, routes = route_list(c), interfaces = ifaces }
+end
+
+M.route_save = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { err_msg = "uci 不可用" } end
+    local c = uci.cursor()
+    local id = params.id
+    if id and c:get("network", id) ~= "route" then return { err_msg = "路由不存在" } end
+    if not id then
+        c:set("network", "glass_" .. tostring(os.time()), "route")
+        id = nil
+        local found
+        c:foreach("network", "route", function(s) if not found and s.target == nil then found = s[".name"] end end)
+        id = found
+    end
+    if not id then return { err_msg = "创建失败" } end
+    c:set("network", id, "target", params.target or "")
+    c:set("network", id, "netmask", params.netmask or "255.255.255.255")
+    c:set("network", id, "gateway", params.gateway or "")
+    if params.interface and params.interface ~= "" then
+        c:set("network", id, "interface", params.interface)
+    end
+    c:set("network", id, "disabled", params.enabled == false and "1" or "0")
+    c:commit("network")
+    run("ubus call network reload")
+    return { res = true, routes = route_list(c) }
+end
+
+M.route_del = function(params)
+    local ok, uci = pcall(require, "uci")
+    if not ok then return { err_msg = "uci 不可用" } end
+    local c = uci.cursor()
+    if c:get("network", params.id or "") ~= "route" then return { err_msg = "路由不存在" } end
+    c:delete("network", params.id)
+    c:commit("network")
+    run("ubus call network reload")
+    return { res = true, routes = route_list(c) }
+end
+return M

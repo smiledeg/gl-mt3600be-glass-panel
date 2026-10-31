@@ -1,0 +1,29 @@
+Package: gl-glass-panel
+Version: 3.0.41-1
+Section: admin
+Architecture: all
+Maintainer: Kou <kou@local>
+Description: Glass Panel v3 for GL-MT3600BE - full advanced admin panel
+ Vue 3 + TypeScript + Naive UI admin panel that merges the stock GL.iNet
+ SDK4 backend (/rpc, 52 official views) with the NRadio NUI plugin backend
+ (bridged over the same session), so one panel covers both feature sets.
+ .
+ * 59 sections: overview / cellular(sim,lock,data,at,sms) / internet +
+   multiwan / wireless(main,guest,repeater,acl) / clients / network(lan,
+   dhcp,dns,ipv6,nat,routes,igmp,adv) / security(firewall,acl,remote,
+   parental,dpi) / flow(stats,qos,sqm) / vpn(client,wg,ovpn,tailscale,
+   zerotier,tor) / cloud(goodcloud,ddns,sdwan) / apps(store,nas,adguard)
+   / tools(speedtest,diag,monitor,conn) / system(info,password,upgrade,
+   timer,timezone,button,fan,reset,logs,advanced,ui) / about
+ * Realtime metrics, diagnostics, speedtest, monitor charts, fan policy,
+   SMS and cell tools via the read-only RPC object "glass" and the NUI
+   bridge object "nui" (requires luci-app-nradio-nui runtime on device;
+   pages degrade with a clear message when it is missing).
+ * v3.0.2: bundled minimal NRadio NUI *backend runtime* (Lua modules + speed/diag
+   scripts) so speedtest/diagnostics/monitor/SSH keep working without the
+   incompatible NUI frontend; the NUI web page/skin/LuCI pages are not shipped.
+   Cellular menu + cards auto-hide when no modem is detected; mobile layout uses
+   a full drawer navigation; session-expiry auto re-login.
+ * Root path "/" optionally redirects to the panel (zz-glass-root.conf,
+   removable); GL official UI (/gl_home.html) and LuCI are never modified.
+Source: local build

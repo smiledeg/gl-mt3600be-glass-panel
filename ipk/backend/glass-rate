@@ -1,0 +1,35 @@
+#!/bin/sh
+# Glass Panel 首页实时速率历史记录器
+# 每 3 秒采一次全机总速率（/proc/net/dev，排除 lo），只保留最近 60 个点（3 分钟），
+# 全部写 /tmp（内存），重启即清空；只在「界面设置 → 首页 → 实时速率显示最近记录」开启时运行。
+FILE=/tmp/glass-rate.jsonl
+KEEP=60
+INTERVAL=3
+
+rm -f "$FILE" "$FILE.tmp" 2>/dev/null
+last_rx=0
+last_tx=0
+first=1
+
+while true; do
+    # /proc/net/dev: iface: rx_bytes ... tx_bytes ...
+    set -- $(awk -F'[: ]+' '/:/ && $1 !~ /^lo$/ {rx += $2; tx += $10} END {print rx+0, tx+0}' /proc/net/dev 2>/dev/null)
+    rx=${1:-0}
+    tx=${2:-0}
+    if [ "$first" = "1" ]; then
+        first=0
+    else
+        drx=$((rx - last_rx))
+        dtx=$((tx - last_tx))
+        [ "$drx" -lt 0 ] && drx=0
+        [ "$dtx" -lt 0 ] && dtx=0
+        vt=$(date +%s)
+        printf '%s %s %s\n' "$vt" "$drx" "$dtx" >> "$FILE" 2>/dev/null
+        if [ -f "$FILE" ]; then
+            tail -n "$KEEP" "$FILE" > "$FILE.tmp" 2>/dev/null && mv -f "$FILE.tmp" "$FILE" 2>/dev/null
+        fi
+    fi
+    last_rx=$rx
+    last_tx=$tx
+    sleep "$INTERVAL"
+done

@@ -1,0 +1,28 @@
+#!/bin/sh
+# Glass Panel v3 - postrm
+# 卸载：撤销入口片段、RPC 对象与内置的 NUI 最小后端运行时；官方后台 / LuCI 不受影响。
+#
+# 注意：如果设备上另外装了 luci-app-nradio-nui（opkg 包），则保留运行时（归插件所有）。
+DESCRIPT="Glass Panel v3"
+
+rm -f /etc/nginx/gl-conf.d/zz-glass-root.conf /etc/nginx/gl-conf.d/zz-glass.conf 2>/dev/null || true
+rm -f /usr/lib/oui-httpd/rpc/glass /usr/lib/oui-httpd/rpc/nui 2>/dev/null || true
+rm -rf /www/glass 2>/dev/null || true
+rm -rf /etc/glass-nui-backup 2>/dev/null || true
+rm -f /tmp/glass-cpu.stat /tmp/glass-nginx-test.log 2>/dev/null || true
+
+# 内置的 NUI 运行时（本包所有；装了真正的 NUI 插件时跳过，避免删掉插件文件）
+if ! opkg status luci-app-nradio-nui >/dev/null 2>&1; then
+    rm -rf /usr/lib/lua/luci/nui /usr/share/nui 2>/dev/null || true
+    rm -f  /usr/libexec/nui-dlbench /usr/libexec/nui-exptest /usr/libexec/nui-https-local \
+           /usr/libexec/nui-speed-http /usr/libexec/nui-speedtest /usr/libexec/nui-wifiscan 2>/dev/null || true
+    rm -f  /www/cgi-bin/nui-speed /usr/lib/lua/luci/nradio.lua /usr/share/gl-validator.d/nui.lua 2>/dev/null || true
+fi
+
+if command -v nginx >/dev/null 2>&1; then
+    nginx -t >/dev/null 2>&1 && nginx -s reload >/dev/null 2>&1 || true
+fi
+rm -rf /tmp/luci-modulecache /tmp/luci-indexcache 2>/dev/null || true
+
+echo "$DESCRIPT: removed. 入口已还原：/ 回到官方后台，/gl_home.html 不受影响。"
+exit 0
