@@ -239,11 +239,13 @@ const menuOptions = computed<MenuOption[]>(() =>
           label: item.label,
           icon: icon(GROUP_ICON[item.label] ?? LayersOutline),
           children: [
-            ...item.children.map((c: any) => ({
-              key: c.key,
-              label: c.label,
-              icon: icon(SECTION_ICON[c.key] ?? EllipseOutline),
-            })),
+            ...item.children
+              .filter((c: any) => !(c.key === '/system/button' && device.hasButton === false))
+              .map((c: any) => ({
+                key: c.key,
+                label: c.key === '/system/fan' && device.hasFan === false ? '温度' : c.label,
+                icon: icon(SECTION_ICON[c.key] ?? EllipseOutline),
+              })),
             ...(item.label === '应用'
               ? extraApps.value.map((a) => ({
                   key: `/apps/app/${a.package}`,
@@ -281,7 +283,11 @@ function onMenuButton() {
 const activeKey = computed(() => route.path)
 /** 侧栏里存在的页面才算合法路由；旧链接（如 /system/enhance）显示 404 卡片而不是白屏 */
 const knownPath = computed(() => route.path.startsWith('/apps/app/') || NAV_FLAT.some((i) => i.key === route.path))
-const crumb = computed(() => titleFor(route.path))
+const crumb = computed(() => {
+  const c = titleFor(route.path)
+  if (route.path === '/system/fan' && device.hasFan === false) return { ...c, title: '温度' }
+  return c
+})
 const pageTitle = computed(() => crumb.value.title)
 const pageGroup = computed(() => crumb.value.group)
 const deviceName = computed(() => String(device.info?.model ?? 'GL-MT3600BE').toUpperCase())
@@ -377,6 +383,7 @@ onMounted(() => {
     if (!ok) handleExpired()
   }, 60000)
   void device.refresh(route.name as PageKey)
+  void device.checkHardwareCaps()
   void loadExtraApps()
   window.addEventListener('glass-pkg-changed', loadExtraApps)
   device.startPolling(ui.refreshMs)

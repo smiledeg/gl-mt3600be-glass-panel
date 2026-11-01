@@ -37,6 +37,33 @@ export const useDeviceStore = defineStore('device', () => {
    * 拿不到任何证据时保持“显示”，避免误隐藏。 */
   const caps = ref<Record<string, any> | null>(null)
   const capsKnown = ref(false)
+  /** 硬件能力：null=还没探测完（先按有处理），false=明确没有，页面/菜单降级 */
+  const hasFan = ref<boolean | null>(null)
+  const hasButton = ref<boolean | null>(null)
+  let hwCapsKnown = false
+  async function checkHardwareCaps() {
+    if (hwCapsKnown) return
+    hwCapsKnown = true
+    try {
+      const hw = await api.call<any>('glass', 'hw_caps').catch(() => null)
+      if (hw && typeof hw.fan === 'boolean') {
+        hasFan.value = hw.fan
+      } else {
+        let f = await api.call<any>('fanctrl', 'get_status').catch(() => null)
+        if (!f || f.supported === false) f = await api.call<any>('fan', 'get_status').catch(() => null)
+        hasFan.value = !!f && f.supported !== false && (f.speed !== undefined || f.status !== undefined || f.config !== undefined || f.rpm !== undefined)
+      }
+    } catch {
+      hasFan.value = false
+    }
+    try {
+      const r = await api.call<any>('switch-button', 'get_funcs')
+      const funcs = r?.funcs ?? r
+      hasButton.value = Array.isArray(funcs) && funcs.length > 0
+    } catch {
+      hasButton.value = false
+    }
+  }
   const hasCellular = computed(() => {
     if (!caps.value) return true
     return !!(caps.value.cellular || caps.value.modem || caps.value.sim || caps.value.modemDevices)
@@ -282,6 +309,9 @@ export const useDeviceStore = defineStore('device', () => {
     caps,
     capsKnown,
     hasCellular,
+    hasFan,
+    hasButton,
+    checkHardwareCaps,
     checkCaps,
     checkConn,
     startPolling,

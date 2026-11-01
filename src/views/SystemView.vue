@@ -58,6 +58,7 @@ import { getRateHistory, setRateHistory } from '@/api/rates'
 import { uploadImage, uploadVideo } from '@/api/media'
 import { useUiStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
+import { useDeviceStore } from '@/stores/device'
 import { BUILD_VERSION } from '@/version'
 import { fmtBytes, fmtDuration, pct } from '@/utils/format'
 
@@ -66,6 +67,7 @@ const section = computed(() => props.section || 'info')
 const message = useMessage()
 const ui = useUiStore()
 const auth = useAuthStore()
+const device = useDeviceStore()
 const router = useRouter()
 
 const errText = (e: unknown) => shortError(e) || '操作失败'
@@ -812,6 +814,7 @@ const FAN_A = useAsync(
     fan: await sys.getFanState(),
     enh: await sys.getEnhOverview(),
     officialCfg: await sys.getFanOfficialConfig().catch(() => null),
+    status: await sys.getGlassStatus().catch(() => null),
   }),
   { immediate: false },
 )
@@ -825,6 +828,13 @@ const fanRpm = computed(() => Number(fcStatus.value?.rpm ?? fanData.value?.fan.o
 const fanTemp = computed(() => {
   const t = fcStatus.value?.temperature ?? fcStatus.value?.temp
   return typeof t === 'number' ? t : null
+})
+const fanPageTemps = computed(() => {
+  const arr = fanData.value?.status?.temps
+  if (Array.isArray(arr) && arr.length) return arr.map((x: any) => ({ name: String(x.name ?? '传感器'), temp: Number(x.temp ?? 0) }))
+  if (fanTemps.value.length) return fanTemps.value.map((x) => ({ name: x.label, temp: x.value }))
+  if (fanTemp.value !== null) return [{ name: '当前温度', temp: fanTemp.value }]
+  return []
 })
 const fanTemps = computed(() => {
   const t = enhFan.value?.temps
@@ -1334,6 +1344,10 @@ const reloaders: Record<string, (silent?: boolean) => Promise<void> | void> = {
   ui: () => reloadUi(),
 }
 function activate(s: string) {
+  if (s === 'button' && device.hasButton === false) {
+    void router.replace('/system/info')
+    return
+  }
   const fn = reloaders[s]
   if (fn) void fn()
 }
@@ -1419,9 +1433,9 @@ watch(section, (s) => {
             </dl>
           </PanelCard>
 
-          <PanelCard class="span-4" title="温度与风扇">
+          <PanelCard class="span-4" :title="device.hasFan === false ? '温度' : '温度与风扇'">
             <template #icon><n-icon><ThermometerOutline /></n-icon></template>
-            <div class="nui-between" style="margin-bottom: 8px">
+            <div v-if="device.hasFan !== false" class="nui-between" style="margin-bottom: 8px">
               <div>
                 <div class="nui-big">{{ fanRpmInfo }}<span class="nui-unit">RPM</span></div>
                 <div class="nui-small nui-muted">当前风扇转速</div>
@@ -1954,7 +1968,25 @@ watch(section, (s) => {
 
     <!-- ================= fan ================= -->
     <template v-if="section === 'fan'">
-      <PageState :loading="fanLoading" :error="fanError" :empty="!fanData" empty-text="风扇接口不可用" @retry="reloadFan">
+      <template v-if="device.hasFan === false">
+        <PageState :loading="fanLoading" :error="fanError" :empty="!fanData" empty-text="温度接口不可用" @retry="reloadFan">
+          <div class="nui-grid">
+            <PanelCard class="span-12" title="温度">
+              <template #icon><n-icon><ThermometerOutline /></n-icon></template>
+              <p class="nui-small nui-muted" style="margin: 0 0 10px">当前设备未检测到风扇，已自动降级为温度显示。</p>
+              <n-data-table v-if="fanPageTemps.length" :columns="tempColumns" :data="fanPageTemps" :row-key="(r) => r.name" size="small" :bordered="false" />
+              <div v-else-if="fanTemps.length" class="fan-temps">
+                <div v-for="t in fanTemps" :key="t.label" class="fan-temp">
+                  <b>{{ t.value }}<span class="nui-unit">℃</span></b>
+                  <span class="nui-small nui-muted">{{ t.label }}</span>
+                </div>
+              </div>
+              <p v-else class="nui-small nui-muted" style="margin: 8px 0 0">未读到温度传感器</p>
+            </PanelCard>
+          </div>
+        </PageState>
+      </template>
+      <PageState v-else :loading="fanLoading" :error="fanError" :empty="!fanData" empty-text="风扇接口不可用" @retry="reloadFan">
         <div class="nui-grid">
           <PanelCard class="span-4" title="风扇状态">
             <template #icon><n-icon><ThermometerOutline /></n-icon></template>

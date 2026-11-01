@@ -175,6 +175,7 @@ export const getSystemInfo = () => api.call<SysInfo>('system', 'get_info')
 
 /** 单个读取（应用页用来取服务运行状态：service[]） */
 export const getSystemStatus = () => api.call<SysStatus>('system', 'get_status')
+export const getGlassStatus = () => api.call<GlassStatus>('glass', 'get_status')
 
 /* ========================================================================
  * 2. 管理员密码 / SSH

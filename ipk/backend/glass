@@ -1242,4 +1242,27 @@ M.check_update = function()
     return { ok = true, version = tag:gsub("^v", ""), tag = tag, url = url or "" }
 end
 
+
+--- @object-method: hw_caps
+M.hw_caps = function()
+    local fan = false
+    local p = io.popen("for f in /sys/class/hwmon/hwmon*/fan1_input /sys/class/fan/fan_speed; do "
+        .. "[ -e \"$f\" ] && { echo yes; break; }; done 2>/dev/null")
+    if p then
+        local v = p:read("*l")
+        p:close()
+        fan = v == "yes"
+    end
+    if not fan then
+        local c = io.popen("for d in /sys/class/thermal/cooling_device*; do "
+            .. "cat $d/type 2>/dev/null; done 2>/dev/null")
+        if c then
+            local all = c:read("*a") or ""
+            c:close()
+            fan = all:lower():find("fan", 1, true) ~= nil
+        end
+    end
+    return { fan = fan }
+end
+
 return M
