@@ -901,6 +901,34 @@ end
 -- =====================================================================
 local PKG_PREFIX = "/tmp/glass-pkg-"
 
+local function pkg_manager()
+    local apk = run("command -v apk 2>/dev/null")
+    if apk ~= "" then return "apk" end
+    return "opkg"
+end
+
+local function installed_packages()
+    local mgr = pkg_manager()
+    local out = run((mgr == "apk" and "apk list -I 2>/dev/null" or "opkg list-installed 2>/dev/null"))
+    local list = {}
+    if mgr == "apk" then
+        for line in out:gmatch("[^\n]+") do
+            -- 第一列是 name-version-rN，第二列是架构
+            local first = line:match("^(%S+)%s+%S+")
+            if first then
+                local name, ver = first:match("^(.-)%-([%w%.~%+_]+%-r%d+)$")
+                if name and ver then list[#list + 1] = { name = name, version = ver:gsub("%s+$", "") } end
+            end
+        end
+    else
+        for name, ver in out:gmatch("([%w%._%+%-]+)%s+%-%s+([^\n]+)") do
+            list[#list + 1] = { name = name, version = ver:gsub("%s+$", "") }
+        end
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    return list
+end
+
 M.pkg_upload_begin = function(params)
     local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
     if id == "" then return { ok = false, err = "非法 ID" } end
@@ -925,23 +953,29 @@ M.pkg_upload_finish = function(params)
     local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
     if id == "" then return { ok = false, err = "非法 ID" } end
     local part = PKG_PREFIX .. id .. ".part"
-    local dst = PKG_PREFIX .. id .. ".ipk"
+    local ext = (pkg_manager() == "apk") and ".apk" or ".ipk"
+    local dst = PKG_PREFIX .. id .. ext
     local ok, err = os.rename(part, dst)
     if not ok then return { ok = false, err = tostring(err or "保存失败") } end
     run("chmod 644 '" .. dst .. "' 2>/dev/null")
-    return { ok = true, id = id, size = tonumber(run("wc -c < '" .. dst .. "' 2>/dev/null")) or 0 }
+    return { ok = true, id = id, ext = ext, size = tonumber(run("wc -c < '" .. dst .. "' 2>/dev/null")) or 0 }
 end
 
 M.pkg_install = function(params)
     local id = tostring(params and params.id or ""):gsub("[^%w%-_]", "")
     if id == "" then return { ok = false, err = "非法 ID" } end
-    local ipk = PKG_PREFIX .. id .. ".ipk"
+    local mgr = pkg_manager()
+    local ext = (mgr == "apk") and ".apk" or ".ipk"
+    local ipk = PKG_PREFIX .. id .. ext
     local log = PKG_PREFIX .. id .. ".log"
     local size = tonumber(run("wc -c < '" .. ipk .. "' 2>/dev/null")) or 0
     if size < 100 then return { ok = false, err = "安装包为空，请重新上传" } end
     run("rm -f '" .. log .. "'")
-    os.execute(string.format("( opkg install --force-reinstall '%s' > '%s' 2>&1; echo \"__GLASS_DONE__:$?\" >> '%s'; rm -f '%s' ) >/dev/null 2>&1 &",
-        ipk, log, log, ipk))
+    local cmd = (mgr == "apk")
+        and ("apk add --allow-untrusted --force-non-repository --force-reinstall '" .. ipk .. "'")
+        or ("opkg install --force-reinstall '" .. ipk .. "'")
+    os.execute(string.format("( %s > '%s' 2>&1; echo \"__GLASS_DONE__:$?\" >> '%s'; rm -f '%s' ) >/dev/null 2>&1 &",
+        cmd, log, log, ipk))
     return { ok = true, id = id, log = log }
 end
 
@@ -951,6 +985,16 @@ M.pkg_install_status = function(params)
     local text = read_all(log) or ""
     local code = tonumber(text:match("__GLASS_DONE__:(%d+)"))
     return { id = id, log = text, done = code ~= nil, code = code }
+end
+
+--- @object-method: pkg_manager
+M.pkg_manager = function()
+    return { manager = pkg_manager() }
+end
+
+--- @object-method: pkg_list
+M.pkg_list = function()
+    return { manager = pkg_manager(), packages = installed_packages() }
 end
 
 --- @object-method: pkg_apps
@@ -991,8 +1035,8 @@ M.pkg_apps = function()
         end
         return known[short]
     end
-    local out = run("opkg list-installed 2>/dev/null")
-    for name, ver in out:gmatch("([%w%._%+%-]+)%s+%-%s+([^\n]+)") do
+    for _, p in ipairs(installed_packages()) do
+        local name, ver = p.name, p.version
         local short = name:match("^luci%-app%-(.+)$")
         if short then
             local url = service_url(short)
@@ -1000,7 +1044,7 @@ M.pkg_apps = function()
                 apps[#apps + 1] = {
                     package = name,
                     label = labels[short] or short,
-                    version = ver:gsub("%s+$", ""),
+                    version = ver,
                     url = url,
                 }
             end

@@ -104,7 +104,7 @@ const router = createRouter({
           path: 'apps/:section',
           name: 'apps',
           component: () => import('@/views/AppsView.vue'),
-          props: (r) => ({ section: sectionFor(r.path) ?? String(r.params.section || 'store') }),
+          props: (r) => ({ section: sectionFor(r.path) ?? String(r.params.section || 'nas') }),
         },
 
         // 工具
@@ -219,7 +219,6 @@ export const NAV = [
   {
     label: '应用',
     children: [
-      { key: '/apps/store', label: '插件管理', section: 'store' },
       { key: '/apps/nas', label: '文件共享', section: 'nas' },
       { key: '/apps/adguard', label: 'AdGuard Home', section: 'adguard' },
     ],
@@ -284,6 +283,8 @@ export function titleFor(path: string): { group: string; title: string } {
 }
 
 router.beforeEach((to) => {
+  if (to.path === '/apps/store') return { path: '/apps/nas' }
+
   const auth = useAuthStore()
   if (to.meta.public) return true
   if (!isDemo && !auth.loggedIn) return { path: '/login', query: { next: to.fullPath } }

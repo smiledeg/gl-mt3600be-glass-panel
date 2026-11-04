@@ -9,7 +9,6 @@
  * 危险操作（安装/卸载软件包、磁盘格式化/弹出）一律不做，给官方入口与 opkg 命令提示。
  */
 import { computed, h, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import {
   NAlert,
   NButton,
@@ -37,13 +36,12 @@ import PanelCard from '@/components/PanelCard.vue'
 import PageState from '@/components/PageState.vue'
 import { useAsync, shortError } from '@/composables/useAsync'
 import * as sys from '@/api/sys'
-import { installIpk, pkgApps, pkgInstallStatus, uploadIpk } from '@/api/pkg'
+import { installIpk, pkgApps, pkgInstallStatus, pkgList, pkgManager, uploadIpk } from '@/api/pkg'
 import { fmtAgo, fmtBytes, pct } from '@/utils/format'
 
 const props = defineProps<{ section?: string }>()
 const section = computed(() => props.section || 'store')
 const message = useMessage()
-const router = useRouter()
 const errText = (e: unknown) => shortError(e) || '操作失败'
 
 /* 设备能力位（三页共用，进页面读一次） */
@@ -57,16 +55,22 @@ const board = computed(() => sysInfo.value?.board_info ?? {})
  * ==================================================================== */
 const STORE_A = useAsync(
   async () => ({
-    cfg: await sys.getPluginsConfig(),
-    repo: await sys.getRepoStatus(),
+    cfg: await sys.getPluginsConfig().catch(() => null),
+    repo: await sys.getRepoStatus().catch(() => null),
     list: await sys.getPluginList({ limit: 200, page: 1, status: 1 }).catch(() => null),
+    mgr: await pkgManager(),
+    pkgs: await pkgList(),
   }),
   { immediate: false },
 )
 const { data: storeData, loading: storeLoading, error: storeError, reload: reloadStore } = STORE_A
 const sources = computed(() => storeData.value?.cfg?.source ?? [])
 const repo = computed(() => storeData.value?.repo ?? null)
-const installed = computed(() => storeData.value?.list?.packages ?? [])
+const pkgMgr = computed(() => storeData.value?.mgr ?? 'opkg')
+const installed = computed(() => {
+  const off = storeData.value?.list?.packages ?? []
+  return off.length ? off : storeData.value?.pkgs ?? []
+})
 const search = ref('')
 const installedRows = computed(() =>
   installed.value
@@ -114,11 +118,6 @@ const ipkPct = ref(0)
 const ipkLog = ref('')
 const ipkDone = ref(false)
 const ipkOk = ref(false)
-const lastApp = ref<{ package: string; label: string; url: string } | null>(null)
-function openLastApp() {
-  if (!lastApp.value) return
-  router.push(`/apps/app/${lastApp.value.package}`)
-}
 function pickIpk() {
   ipkFile.value?.click()
 }
@@ -127,8 +126,9 @@ async function onIpkFile(e: Event) {
   const f = input.files?.[0]
   input.value = ''
   if (!f) return
-  if (!/\.ipk$/i.test(f.name)) {
-    message.warning('请选择 .ipk 安装包（OpenWrt 21.02/opkg）')
+  const ext = pkgMgr.value === 'apk' ? '.apk' : '.ipk'
+  if (!new RegExp(ext.replace('.', '\\.') + '$', 'i').test(f.name)) {
+    message.warning(pkgMgr.value === 'apk' ? '请选择 .apk 安装包（OpenWrt 25.12/apk）' : '请选择 .ipk 安装包（OpenWrt 21.02/opkg）')
     return
   }
   ipkBusy.value = true
@@ -136,7 +136,6 @@ async function onIpkFile(e: Event) {
   ipkLog.value = ''
   ipkDone.value = false
   ipkOk.value = false
-  lastApp.value = null
   try {
     const id = await uploadIpk(f, (p) => (ipkPct.value = p))
     const r = await installIpk(id)
@@ -152,9 +151,7 @@ async function onIpkFile(e: Event) {
     if (st && st.code === 0) {
       ipkOk.value = true
       message.success('插件安装成功')
-      const apps = await pkgApps()
-      const n = f.name.toLowerCase()
-      lastApp.value = apps.find((a) => n.includes(a.label.toLowerCase())) || apps[0] || null
+      await pkgApps()
       window.dispatchEvent(new Event('glass-pkg-changed'))
       await reloadStore(true)
     } else {
@@ -167,12 +164,11 @@ async function onIpkFile(e: Event) {
     ipkBusy.value = false
   }
 }
-const OPKG_HINTS = [
-  'opkg update',
-  'opkg list-installed | grep -i nui',
-  'opkg install /tmp/luci-app-xxx.ipk',
-  'opkg remove luci-app-xxx',
-]
+const PKG_HINTS = computed(() =>
+  pkgMgr.value === 'apk'
+    ? ['apk update', 'apk info', 'apk add --allow-untrusted --force-non-repository /tmp/luci-app-xxx.apk', 'apk del luci-app-xxx']
+    : ['opkg update', 'opkg list-installed | grep -i nui', 'opkg install /tmp/luci-app-xxx.ipk', 'opkg remove luci-app-xxx'],
+)
 
 /* ======================================================================
  * nas —— 网络存储
@@ -317,7 +313,7 @@ watch(
           <template #icon><n-icon><CloudDownloadOutline /></n-icon></template>
           <template #extra>
             <div class="nui-row">
-              <n-popconfirm @positive-click="refreshRepo">
+              <n-popconfirm v-if="pkgMgr === 'opkg'" @positive-click="refreshRepo">
                 <template #trigger>
                   <n-button size="small" secondary :loading="repoBusy">
                     <template #icon><n-icon><RefreshOutline /></n-icon></template>
@@ -362,19 +358,16 @@ watch(
         <PanelCard class="span-12" title="手动安装插件包">
           <template #icon><n-icon><CloudDownloadOutline /></n-icon></template>
           <template #extra>
-            <n-button size="small" type="primary" secondary :loading="ipkBusy" @click="pickIpk">选择 ipk 安装</n-button>
-            <input ref="ipkFile" type="file" accept=".ipk" style="display: none" @change="onIpkFile" />
+            <n-button size="small" type="primary" secondary :loading="ipkBusy" @click="pickIpk">选择 {{ pkgMgr === 'apk' ? 'apk' : 'ipk' }} 安装</n-button>
+            <input ref="ipkFile" type="file" :accept="pkgMgr === 'apk' ? '.apk' : '.ipk'" style="display: none" @change="onIpkFile" />
           </template>
           <p class="nui-small nui-muted" style="margin: 0 0 10px">
-            选择 OpenWrt 21.02 / opkg 的 .ipk 插件包（建议 aarch64_cortex-a53 或 all）。安装完成后，
+            选择当前设备的 {{ pkgMgr === 'apk' ? '.apk（OpenWrt 25.12 / apk）' : '.ipk（OpenWrt 21.02 / opkg）' }} 插件包。安装完成后，
             LuCI 插件会自动出现在左侧「应用」菜单里，点击即可打开。
           </p>
           <n-progress v-if="ipkBusy || ipkPct" :percentage="ipkPct" :status="ipkBusy ? 'info' : ipkOk ? 'success' : ipkDone ? 'error' : 'default'" style="margin-bottom: 10px" />
           <pre v-if="ipkLog" class="ipk-log">{{ ipkLog }}</pre>
           <div class="nui-row nui-wrap" style="gap: 8px; margin-top: 10px">
-            <n-button v-if="lastApp" size="small" type="primary" @click="openLastApp">
-              打开 {{ lastApp.label }}
-            </n-button>
             <n-button size="small" quaternary tag="a" href="/gl_home.html?official=1#/plugins" target="_blank">官方插件页</n-button>
           </div>
         </PanelCard>
@@ -401,15 +394,15 @@ watch(
             <n-data-table :columns="installedColumns" :data="installedRows" size="small" :bordered="false" :max-height="380" virtual-scroll />
           </PageState>
           <n-alert type="info" :bordered="false" style="margin: 10px 6px 0">
-            手动安装仅接受 .ipk；请确认架构匹配，误装/误删系统包可能导致设备失联。也可用 SSH 执行下面的命令。
+            手动安装仅接受 {{ pkgMgr === 'apk' ? '.apk' : '.ipk' }}；请确认架构匹配，误装/误删系统包可能导致设备失联。也可用 SSH 执行下面的命令。
           </n-alert>
         </PanelCard>
 
-        <PanelCard class="span-6" title="opkg 命令提示">
+        <PanelCard class="span-6" :title="`${pkgMgr} 命令提示`">
           <template #icon><n-icon><InformationCircleOutline /></n-icon></template>
-          <pre class="cmd">{{ OPKG_HINTS.join('\n') }}</pre>
+          <pre class="cmd">{{ PKG_HINTS.join('\n') }}</pre>
           <p class="nui-small nui-muted" style="margin: 10px 0 0">
-            安装前先确认架构为 aarch64_cortex-a53（本机 OpenWrt 21.02 / kernel 5.4.281），ipk 与固件分支要匹配。
+            安装前先确认包架构与当前固件匹配；apk 与 ipk 不能混用。
           </p>
         </PanelCard>
 

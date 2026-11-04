@@ -9,13 +9,12 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
-    version: '3.1.0-2',
-    date: '2026-11-01',
-    title: '无风扇/无按钮设备自动降级',
+    version: '3.1.0-4',
+    date: '2026-11-04',
+    title: '移除插件管理页',
     items: [
-      '新增硬件能力探测：按 sysfs 判断是否真的有风扇，避免 0 RPM 或无风扇设备仍显示风扇转速。',
-      '没有风扇时「风扇与温度」自动变为「温度」，只显示温度；系统信息卡也不再显示 RPM。',
-      '没有拨动开关能力时隐藏「按钮设置」入口。',
+      '删除「应用 → 插件管理」页面及其菜单入口；直接访问旧地址自动跳转到文件共享。',
+      '保留文件共享、AdGuard Home 等其它应用页面。',
     ],
   },
 ]

@@ -45,3 +45,31 @@ export async function pkgApps(): Promise<InstalledApp[]> {
     return []
   }
 }
+
+
+export type PkgManager = 'opkg' | 'apk'
+
+export interface InstalledPkg {
+  name: string
+  version: string
+}
+
+/** 当前设备的包管理器：apk 或 opkg */
+export async function pkgManager(): Promise<PkgManager> {
+  try {
+    const r = await api.call<{ manager?: string }>('glass', 'pkg_manager')
+    return r?.manager === 'apk' ? 'apk' : 'opkg'
+  } catch {
+    return 'opkg'
+  }
+}
+
+/** 已安装软件包（两种包管理器通用） */
+export async function pkgList(): Promise<InstalledPkg[]> {
+  try {
+    const r = await api.call<{ packages?: InstalledPkg[] }>('glass', 'pkg_list')
+    return Array.isArray(r?.packages) ? r.packages : []
+  } catch {
+    return []
+  }
+}
